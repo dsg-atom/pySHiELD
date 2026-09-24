@@ -29,6 +29,7 @@ block) so the coefficient download does not hit the home-directory quota.
 import argparse
 
 import numpy as np
+import xarray as xr
 
 from pyrte_rrtmgp import rte
 from pyrte_rrtmgp.examples import RFMIP_FILES, load_example_file
@@ -41,6 +42,32 @@ BANDS = {
     "lw": (GasOpticsFiles.LW_G256, rte.OpticsTypes.ABSORPTION),
     "sw": (GasOpticsFiles.SW_G224, rte.OpticsTypes.TWO_STREAM),
 }
+
+
+def strip_bad_attrs(dataset: xr.Dataset) -> xr.Dataset:
+    """Drop attributes netCDF cannot serialize.
+
+    pyRTE attaches metadata such as `top_at_1` whose value is an xarray
+    DataArray. netCDF attributes must be plain scalars/strings/arrays, so
+    writing fails. We only need the numeric fields for the reference, so we
+    drop any attribute that is not a valid netCDF attribute type (and coerce
+    numpy booleans to int).
+    """
+    valid = (str, bytes, int, float, complex, np.ndarray, np.number, list, tuple)
+
+    def clean(attrs: dict) -> dict:
+        out = {}
+        for key, value in attrs.items():
+            if isinstance(value, (bool, np.bool_)):
+                out[key] = int(value)
+            elif isinstance(value, valid):
+                out[key] = value
+        return out
+
+    dataset.attrs = clean(dataset.attrs)
+    for var in dataset.variables.values():
+        var.attrs = clean(var.attrs)
+    return dataset
 
 
 def build_reference(band: str):
@@ -84,16 +111,18 @@ def main():
             "gas optics added no variables -- check the pyRTE compute API"
         )
 
-    reference = atmosphere[new_vars]
-    reference.to_netcdf(args.out)
+    reference = strip_bad_attrs(atmosphere[new_vars])
 
-    print(f"band {args.band}: wrote {len(new_vars)} fields to {args.out}")
+    print(f"band {args.band}: {len(new_vars)} fields")
     for name in new_vars:
         var = reference[name]
         print(
             f"  {name:28s} dims={tuple(var.dims)} shape={var.shape} "
             f"sum={float(np.asarray(var).sum()):.6e}"
         )
+
+    reference.to_netcdf(args.out)
+    print(f"wrote {args.out}")
 
 
 if __name__ == "__main__":
