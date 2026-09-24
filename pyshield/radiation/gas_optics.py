@@ -45,6 +45,14 @@ range()` (only `while`), and it unrolls data-dim accesses at compile time, so
 a runtime data-dim write index is not supported. The loop-driven form reuses
 only already-proven pieces (the Stage-2 runtime-index `.A` gather) and keeps
 `tau` a single resident data-dimension Quantity.
+
+Stage 4: the major/minor interpolation weights (`fmajor`, `fminor`) from the
+temperature/pressure/eta fractions (tail of the Fortran `interpolation`
+routine, kernels lines 158-166). Pure float math, no gather. This completes
+the `interpolation` routine: it turns Stage-1 `ftemp`/`fpress` and Stage-2
+`feta` into the eight `fmajor` weights the Stage-3 kmajor interpolation
+consumes and the four `fminor` weights the minor-gas 2-D interpolation
+consumes.
 """
 
 from ndsl.dsl.gt4py import GlobalTable, PARALLEL, computation, floor, interval, log
@@ -175,6 +183,74 @@ def interp_eta_1flavor(
         loceta1 = eta1 * neta_m1
         jeta1 = min(floor(loceta1) + 1.0, neta_m1)
         feta1 = loceta1 - floor(loceta1)
+
+
+def interp_weights(
+    ftemp: FloatField,
+    fpress: FloatField,
+    feta1: FloatField,
+    feta2: FloatField,
+    fmn11: FloatField,
+    fmn21: FloatField,
+    fmn12: FloatField,
+    fmn22: FloatField,
+    f111: FloatField,
+    f211: FloatField,
+    f121: FloatField,
+    f221: FloatField,
+    f112: FloatField,
+    f212: FloatField,
+    f122: FloatField,
+    f222: FloatField,
+):
+    """Major/minor interpolation weights from the T/p/eta fractions.
+
+    Port of the weight construction at the tail of the Fortran `interpolation`
+    routine (kernels lines 158-166), per cell and per flavor. Pure float math;
+    no table gather. Completes the `interpolation` routine.
+
+    Inputs (per cell):
+      ftemp  -- temperature fraction (Stage 1, interp_tp),
+      fpress -- pressure fraction (Stage 1, interp_tp),
+      feta1  -- eta fraction of temperature bracket 1 (Stage 2, itemp=1),
+      feta2  -- eta fraction of temperature bracket 2 (Stage 2, itemp=2).
+
+    The temperature-bracket term is `(1-ftemp)` for bracket 1 and `ftemp` for
+    bracket 2 (Fortran `(2-itemp) + (2*itemp-3)*ftemp`).
+
+    Outputs:
+      fminor fmn<e><t> = fminor(eta-level e, temp-level t):
+        fmn11 = (1-feta1)*(1-ftemp), fmn21 = feta1*(1-ftemp),
+        fmn12 = (1-feta2)*ftemp,     fmn22 = feta2*ftemp;
+      fmajor f<e><p><t> = fmajor(eta-level e, press-level p, temp-level t):
+        f<e>1<t> = (1-fpress)*fmn<e><t>,  f<e>2<t> = fpress*fmn<e><t>.
+    The eight fmajor feed interp3d_major_1gpt/_gpt; the four fminor feed the
+    minor-gas 2-D interpolation. Each of the eight fmajor and the four fminor
+    sums to 1 over a cell (partition of unity).
+    """
+    with computation(PARALLEL), interval(...):
+        ft1 = 1.0 - ftemp
+        fp0 = 1.0 - fpress
+
+        # fminor (eta-level, temp-level), via the per-bracket temperature term
+        m11 = (1.0 - feta1) * ft1
+        m21 = feta1 * ft1
+        m12 = (1.0 - feta2) * ftemp
+        m22 = feta2 * ftemp
+        fmn11 = m11
+        fmn21 = m21
+        fmn12 = m12
+        fmn22 = m22
+
+        # fmajor = pressure weight * fminor
+        f111 = fp0 * m11
+        f211 = fp0 * m21
+        f121 = fpress * m11
+        f221 = fpress * m21
+        f112 = fp0 * m12
+        f212 = fp0 * m22
+        f122 = fpress * m12
+        f222 = fpress * m22
 
 
 def interp3d_major_1gpt(
