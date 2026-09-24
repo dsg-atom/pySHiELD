@@ -1,28 +1,30 @@
-"""Validate the Stage-3b gas-optics stencil (all g-points, data-dim output).
+"""Validate the Stage-3b gas-optics path (all g-points, data-dim tau).
 
-`interp3d_major_allgpts` runs the same 8-point kmajor interpolation as
-`interp3d_major_1gpt`, but for every g-point in one stencil, writing each
-result into the g-point data axis of a `tau` field declared
-`Field[(Float, (NGPT,))]`. This is the loop structure of the real
-compute_tau_absorption -- columns/layers are the framework's (i, j, k), the
-g-points are a compile-time-unrolled inner loop.
+`interp3d_major_gpt` runs the same 8-point kmajor interpolation as
+`interp3d_major_1gpt`, but selects the g-point with a runtime index field.
+It compiles once and is driven in a Python loop over g-points; each call's
+result is written into the g-point data axis of a `tau` field, so all NGPT
+g-points are filled. This is how the port represents the g-point axis:
+columns/layers are the framework's (i, j, k), the g-points are a host loop.
+
+A single in-stencil g-point loop is not available in this gt4py.cartesian
+frontend (no `for ... in range()`, and data-dim accesses are unrolled at
+compile time, so a runtime data-dim write index is unsupported). The
+loop-driven form reuses only already-proven pieces.
 
 What this proves beyond Stage 3:
-  * a spatial field carrying a g-point data dimension as a stencil output,
-    allocated via quantity_factory.add_data_dimensions + a data-axis name in
-    `dims`;
-  * a compile-time-unrolled `for g in range(ngpt)` loop inside the stencil;
-  * the per-g-point data-dim write `tau[0, 0, 0][g] = ...`.
+  * a spatial field carrying a g-point data dimension ("gpt"), allocated via
+    quantity_factory.add_data_dimensions + a data-axis name in `dims`, filled
+    slice by slice;
+  * a runtime g-point index field into the kmajor gather (`.A[..., igpt]`);
+  * assembly of the full per-g-point tau, matching a numpy transcription over
+    all g-points using the same kmajor table.
 
-The output is checked against a numpy transcription over all g-points using
-the same kmajor table. This is still a mechanism check, not the end-to-end
-tau vs ref_gas_optics_lw.nc (that needs the full flavor/band/minor-gas path).
+This is still a mechanism check, not the end-to-end tau vs ref_gas_optics_lw.nc
+(that needs the full flavor/band/minor-gas path).
 
 Run on Discover inside the fork-a venv with XDG_CACHE_HOME set:
     pytest tests/gas_optics/test_interp3d_major_allgpts.py -q
-
-Note: the stencil unrolls NGPT (=256) iterations, so first-run compile on the
-numpy backend is longer than the earlier stages.
 """
 
 import glob
@@ -37,7 +39,7 @@ from ndsl.config import backend_python
 from ndsl.constants import I_DIM, J_DIM, K_DIM
 from ndsl.dsl.typing import Float, Int
 
-from pyshield.radiation.gas_optics import NGPT, interp3d_major_allgpts
+from pyshield.radiation.gas_optics import NGPT, interp3d_major_gpt
 
 
 def _lw_coeff_file():
@@ -104,15 +106,14 @@ def test_interp3d_major_allgpts():
     )
     assert o_tau.shape == (nx, ny, nz, ngpt)
 
-    # stencil -----------------------------------------------------------------
+    # stencil (compiled once, driven over g-points) --------------------------
     stencil_factory, quantity_factory = get_factories_single_tile(
         nx=nx, ny=ny, nz=nz, nhalo=nhalo, backend=backend_python
     )
     quantity_factory.add_data_dimensions({"gpt": NGPT})
     grid_indexing = stencil_factory.grid_indexing
     stencil = stencil_factory.from_origin_domain(
-        func=interp3d_major_allgpts,
-        externals={"ngpt": NGPT},
+        func=interp3d_major_gpt,
         origin=grid_indexing.origin_compute(),
         domain=grid_indexing.domain_compute(),
     )
@@ -126,6 +127,8 @@ def test_interp3d_major_allgpts():
     scaling1_q, scaling2_q = ff(), ff()
     fw_q = {name: ff() for name in fw}
     jtemp_q, jpress_q, jeta1_q, jeta2_q = fi(), fi(), fi(), fi()
+    igpt_q = fi()
+    res_q = ff()
     tau_q = quantity_factory.zeros([I_DIM, J_DIM, K_DIM, "gpt"], "", dtype=Float)
     assert tau_q.view[:].shape == (nx, ny, nz, ngpt), tau_q.view[:].shape
 
@@ -138,24 +141,29 @@ def test_interp3d_major_allgpts():
     jeta1_q.view[:] = jeta1
     jeta2_q.view[:] = jeta2
 
-    stencil(
-        scaling1=scaling1_q,
-        scaling2=scaling2_q,
-        f111=fw_q["f111"],
-        f211=fw_q["f211"],
-        f121=fw_q["f121"],
-        f221=fw_q["f221"],
-        f112=fw_q["f112"],
-        f212=fw_q["f212"],
-        f122=fw_q["f122"],
-        f222=fw_q["f222"],
-        jtemp=jtemp_q,
-        jpress=jpress_q,
-        jeta1=jeta1_q,
-        jeta2=jeta2_q,
-        kmajor=kmajor,
-        tau=tau_q,
-    )
+    # drive the single compiled stencil once per g-point, assembling tau
+    for g in range(ngpt):
+        igpt_q.view[:] = g
+        stencil(
+            scaling1=scaling1_q,
+            scaling2=scaling2_q,
+            f111=fw_q["f111"],
+            f211=fw_q["f211"],
+            f121=fw_q["f121"],
+            f221=fw_q["f221"],
+            f112=fw_q["f112"],
+            f212=fw_q["f212"],
+            f122=fw_q["f122"],
+            f222=fw_q["f222"],
+            jtemp=jtemp_q,
+            jpress=jpress_q,
+            jeta1=jeta1_q,
+            jeta2=jeta2_q,
+            igpt=igpt_q,
+            kmajor=kmajor,
+            res=res_q,
+        )
+        tau_q.view[:, :, :, g] = res_q.view[:]
 
     np.testing.assert_allclose(tau_q.view[:], o_tau, rtol=1e-12, atol=0.0)
 

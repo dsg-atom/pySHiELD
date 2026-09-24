@@ -34,27 +34,27 @@ Stage 3: the major-gas 8-point k-table interpolation
 (jtemp+1, jpress+1, jeta+1) used as gather indices. The g-point runs as a
 compile-time external.
 
-Stage 3b (here): the same 8-point interpolation, but writing every g-point
-into a data-dimension output field in one stencil. This is the loop
-structure of the real `compute_tau_absorption`: the columns and layers are
-the framework's (i, j, k) spatial axes, and the g-points are an inner loop
-that is unrolled at compile time. It proves the last piece of the gather
-machinery -- a spatial field that carries the g-point axis as a data
-dimension (`Field[(Float, (NGPT,))]`), and the per-g-point data-dim write
-`tau[0, 0, 0][g] = ...`.
+Stage 3b (here): the same 8-point interpolation selecting the g-point by a
+runtime index field, so one compiled stencil fills every g-point when driven
+in a Python loop over g-points. This is how the port represents the
+g-point axis: the columns and layers are the framework's (i, j, k), and the
+g-points are a host loop that writes each result into the g-point data axis
+of a `tau` field. A single in-stencil compile-time-unrolled g-point loop is
+not available here -- this gt4py.cartesian frontend has no `for ... in
+range()` (only `while`), and it unrolls data-dim accesses at compile time, so
+a runtime data-dim write index is not supported. The loop-driven form reuses
+only already-proven pieces (the Stage-2 runtime-index `.A` gather) and keeps
+`tau` a single resident data-dimension Quantity.
 """
 
-from ndsl.dsl.gt4py import Field, GlobalTable, PARALLEL, computation, floor, interval, log
+from ndsl.dsl.gt4py import GlobalTable, PARALLEL, computation, floor, interval, log
 from ndsl.dsl.typing import Float, FloatField, IntField
 
 # Number of longwave g-points (LW_G256). tau carries these as a data
-# dimension; the compute_tau_absorption g-point loop is unrolled over them.
+# dimension ("gpt"); the caller allocates it via
+# quantity_factory.add_data_dimensions({"gpt": NGPT}) and fills one g-point
+# slice per stencil call.
 NGPT = 256
-
-# tau output field: an IJK field carrying the g-point data axis. The
-# "high dimensional dtype" form Field[(dtype, (data_dims,))] gives a spatial
-# field (default IJK axes) with a trailing data dimension of size NGPT.
-TauField = Field[(Float, (NGPT,))]
 
 # vmr_ref reference table, Fortran layout (atmos_layer=2, absorber_ext=20,
 # temperature=14) for the LW_G256 coefficient file. GlobalTable has no spatial
@@ -236,7 +236,7 @@ def interp3d_major_1gpt(
         )
 
 
-def interp3d_major_allgpts(
+def interp3d_major_gpt(
     scaling1: FloatField,
     scaling2: FloatField,
     f111: FloatField,
@@ -251,42 +251,41 @@ def interp3d_major_allgpts(
     jpress: IntField,
     jeta1: IntField,
     jeta2: IntField,
+    igpt: IntField,
     kmajor: KMajor,
-    tau: TauField,
+    res: FloatField,
 ):
-    """Major-gas 8-point interpolation across all g-points, one stencil.
+    """Major-gas 8-point interpolation of the k table, g-point by index field.
 
-    Same expression as `interp3d_major_1gpt`, but the g-point is an inner
-    loop unrolled at compile time, and the result for each g-point is written
-    into the g-point data axis of `tau`. This mirrors the real
-    `compute_tau_absorption` loop nest: columns/layers are the framework's
-    (i, j, k); the g-points are the unrolled inner loop.
+    Same expression as `interp3d_major_1gpt`, but the g-point is a runtime
+    index field `igpt` (every cell holds the same g-point per call) instead of
+    a compile-time external. The stencil therefore compiles once and is driven
+    in a Python loop over g-points -- the caller sets `igpt` to g and copies
+    `res` into the g-point data axis of `tau`, filling all NGPT.
 
-    Here the weights and col_mix scalings are shared across g-points (they
-    isolate the data-dimension write mechanism); the real kernel varies them
-    per flavor/band, which is a later stage.
+    A single in-stencil g-point loop is not available in this gt4py.cartesian
+    frontend (no `for ... in range()`; data-dim accesses are unrolled at
+    compile time, so a runtime data-dim write index is unsupported). The
+    loop-driven form reuses only the Stage-2 runtime-index `.A` gather, which
+    is already validated.
 
     Integer inputs are the 0-based lower-bracket table indices (see
-    `interp3d_major_1gpt`). External `ngpt` is the compile-time g-point count;
-    it must equal the `tau` data-dim size (NGPT) and not exceed kmajor's 4th
-    axis.
+    `interp3d_major_1gpt`). `igpt` is the 0-based g-point index into kmajor's
+    4th axis.
     """
-    from __externals__ import ngpt
-
     with computation(PARALLEL), interval(...):
         jtp = jtemp + 1
         jpp = jpress + 1
         je1p = jeta1 + 1
         je2p = jeta2 + 1
-        for g in range(ngpt):
-            tau[0, 0, 0][g] = scaling1 * (
-                f111 * kmajor.A[jtemp, jeta1, jpress, g]
-                + f211 * kmajor.A[jtemp, je1p, jpress, g]
-                + f121 * kmajor.A[jtemp, jeta1, jpp, g]
-                + f221 * kmajor.A[jtemp, je1p, jpp, g]
-            ) + scaling2 * (
-                f112 * kmajor.A[jtp, jeta2, jpress, g]
-                + f212 * kmajor.A[jtp, je2p, jpress, g]
-                + f122 * kmajor.A[jtp, jeta2, jpp, g]
-                + f222 * kmajor.A[jtp, je2p, jpp, g]
-            )
+        res = scaling1 * (
+            f111 * kmajor.A[jtemp, jeta1, jpress, igpt]
+            + f211 * kmajor.A[jtemp, je1p, jpress, igpt]
+            + f121 * kmajor.A[jtemp, jeta1, jpp, igpt]
+            + f221 * kmajor.A[jtemp, je1p, jpp, igpt]
+        ) + scaling2 * (
+            f112 * kmajor.A[jtp, jeta2, jpress, igpt]
+            + f212 * kmajor.A[jtp, je2p, jpress, igpt]
+            + f122 * kmajor.A[jtp, jeta2, jpp, igpt]
+            + f222 * kmajor.A[jtp, je2p, jpp, igpt]
+        )
