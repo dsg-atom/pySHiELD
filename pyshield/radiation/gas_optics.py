@@ -28,16 +28,33 @@ eta interpolation index `jeta` and fraction `feta`. This is the first
 indices. The gas indices for the flavor are compile-time externals (the
 flavor->gas bookkeeping is host-side numpy setup, not a stencil).
 
-Stage 3 (here): the major-gas 8-point k-table interpolation
+Stage 3: the major-gas 8-point k-table interpolation
 (`interpolate3D_byflav`, kernels lines 760-789), for one g-point. First
 4-axis `GlobalTable` gather (kmajor) and first integer index arithmetic
 (jtemp+1, jpress+1, jeta+1) used as gather indices. The g-point runs as a
-compile-time external here; representing all 256 g-points as a field
-dimension is the next stage.
+compile-time external.
+
+Stage 3b (here): the same 8-point interpolation, but writing every g-point
+into a data-dimension output field in one stencil. This is the loop
+structure of the real `compute_tau_absorption`: the columns and layers are
+the framework's (i, j, k) spatial axes, and the g-points are an inner loop
+that is unrolled at compile time. It proves the last piece of the gather
+machinery -- a spatial field that carries the g-point axis as a data
+dimension (`Field[(Float, (NGPT,))]`), and the per-g-point data-dim write
+`tau[0, 0, 0][g] = ...`.
 """
 
-from ndsl.dsl.gt4py import GlobalTable, PARALLEL, computation, floor, interval, log
+from ndsl.dsl.gt4py import Field, GlobalTable, PARALLEL, computation, floor, interval, log
 from ndsl.dsl.typing import Float, FloatField, IntField
+
+# Number of longwave g-points (LW_G256). tau carries these as a data
+# dimension; the compute_tau_absorption g-point loop is unrolled over them.
+NGPT = 256
+
+# tau output field: an IJK field carrying the g-point data axis. The
+# "high dimensional dtype" form Field[(dtype, (data_dims,))] gives a spatial
+# field (default IJK axes) with a trailing data dimension of size NGPT.
+TauField = Field[(Float, (NGPT,))]
 
 # vmr_ref reference table, Fortran layout (atmos_layer=2, absorber_ext=20,
 # temperature=14) for the LW_G256 coefficient file. GlobalTable has no spatial
@@ -217,3 +234,59 @@ def interp3d_major_1gpt(
             + f122 * kmajor.A[jtp, jeta2, jpp, igpt]
             + f222 * kmajor.A[jtp, je2p, jpp, igpt]
         )
+
+
+def interp3d_major_allgpts(
+    scaling1: FloatField,
+    scaling2: FloatField,
+    f111: FloatField,
+    f211: FloatField,
+    f121: FloatField,
+    f221: FloatField,
+    f112: FloatField,
+    f212: FloatField,
+    f122: FloatField,
+    f222: FloatField,
+    jtemp: IntField,
+    jpress: IntField,
+    jeta1: IntField,
+    jeta2: IntField,
+    kmajor: KMajor,
+    tau: TauField,
+):
+    """Major-gas 8-point interpolation across all g-points, one stencil.
+
+    Same expression as `interp3d_major_1gpt`, but the g-point is an inner
+    loop unrolled at compile time, and the result for each g-point is written
+    into the g-point data axis of `tau`. This mirrors the real
+    `compute_tau_absorption` loop nest: columns/layers are the framework's
+    (i, j, k); the g-points are the unrolled inner loop.
+
+    Here the weights and col_mix scalings are shared across g-points (they
+    isolate the data-dimension write mechanism); the real kernel varies them
+    per flavor/band, which is a later stage.
+
+    Integer inputs are the 0-based lower-bracket table indices (see
+    `interp3d_major_1gpt`). External `ngpt` is the compile-time g-point count;
+    it must equal the `tau` data-dim size (NGPT) and not exceed kmajor's 4th
+    axis.
+    """
+    from __externals__ import ngpt
+
+    with computation(PARALLEL), interval(...):
+        jtp = jtemp + 1
+        jpp = jpress + 1
+        je1p = jeta1 + 1
+        je2p = jeta2 + 1
+        for g in range(ngpt):
+            tau[0, 0, 0][g] = scaling1 * (
+                f111 * kmajor.A[jtemp, jeta1, jpress, g]
+                + f211 * kmajor.A[jtemp, je1p, jpress, g]
+                + f121 * kmajor.A[jtemp, jeta1, jpp, g]
+                + f221 * kmajor.A[jtemp, je1p, jpp, g]
+            ) + scaling2 * (
+                f112 * kmajor.A[jtp, jeta2, jpress, g]
+                + f212 * kmajor.A[jtp, je2p, jpress, g]
+                + f122 * kmajor.A[jtp, jeta2, jpp, g]
+                + f222 * kmajor.A[jtp, je2p, jpp, g]
+            )
