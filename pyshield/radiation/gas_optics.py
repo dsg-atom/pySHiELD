@@ -75,6 +75,15 @@ VmrRef = GlobalTable[(Float, (2, 20, 14))]
 # (temperature, pressure, eta, gpt); the caller transposes to this order.
 KMajor = GlobalTable[(Float, (14, 9, 60, 256))]
 
+# kminor absorption-coefficient table, Fortran layout (temperature=14, eta=9,
+# contributors) for LW_G256. Unlike kmajor there is no pressure axis. The third
+# axis concatenates every minor absorber's g-points across both atmosphere
+# tables (lower=960, upper=544); NMINORK is the max so one stencil serves both
+# (the caller zero-pads the upper table up to NMINORK). Assert the size in the
+# caller. The minor gather is a 4-point (temp x eta) interpolation.
+NMINORK = 960
+KMinor = GlobalTable[(Float, (14, 9, NMINORK))]
+
 
 def interp_tp(
     play: FloatField,
@@ -364,4 +373,45 @@ def interp3d_major_gpt(
             + f212 * kmajor.A[jtp, je2p, jpress, igpt]
             + f122 * kmajor.A[jtp, jeta2, jpp, igpt]
             + f222 * kmajor.A[jtp, je2p, jpp, igpt]
+        )
+
+
+def interp2d_minor_gpt(
+    fmn11: FloatField,
+    fmn21: FloatField,
+    fmn12: FloatField,
+    fmn22: FloatField,
+    jtemp: IntField,
+    jeta1: IntField,
+    jeta2: IntField,
+    kg: IntField,
+    kminor: KMinor,
+    res: FloatField,
+):
+    """Minor-gas 4-point interpolation of the kminor table, one g-point per call.
+
+    Port of the Fortran `interpolate2D_byflav` inner expression (kernels lines
+    738-758): a 2 x 2 interpolation over the two eta brackets and the two
+    temperature brackets, with no pressure dependence (kminor has none). The
+    weights `fmn<eta-level><temp-level>` are the four `fminor` weights from
+    `interp_weights`; `jeta1`/`jeta2` are the eta lower brackets for the two
+    temperature levels of this cell's flavor.
+
+    Like `interp3d_major_gpt`, the g-point is a runtime index field: `kg` is the
+    0-based index into kminor's contributor axis for this g-point of this minor
+    absorber (kminor_start - 1 + offset within the band). The caller drives one
+    stencil call per contributor g-point and accumulates `scaling * res` into
+    tau's g-point data axis.
+
+    Integer inputs are 0-based (Fortran index minus one).
+    """
+    with computation(PARALLEL), interval(...):
+        jtp = jtemp + 1
+        je1p = jeta1 + 1
+        je2p = jeta2 + 1
+        res = (
+            fmn11 * kminor.A[jtemp, jeta1, kg]
+            + fmn21 * kminor.A[jtemp, je1p, kg]
+            + fmn12 * kminor.A[jtp, jeta2, kg]
+            + fmn22 * kminor.A[jtp, je2p, kg]
         )
