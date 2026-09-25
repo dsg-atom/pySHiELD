@@ -9,9 +9,14 @@ and adds the per-cell scaling: minor-gas column amount, an optional density
 factor (0.01*P/T), and an optional complement/second-gas factor.
 
 Reference is pyRTE's compiled RRTMGP Fortran `GasOptics.tau_absorption`. To
-localize failures the test splits the check three ways:
+localize failures the test splits the check three ways, each against a clean
+pyRTE reference that isolates one contribution by zeroing the OTHER table --
+never by subtraction. The minor tau is O(1e-8) and sits inside a major tau of
+O(1-40); recovering it as (full - major) would lose ~7 digits to float64
+cancellation (noise floor eps*major/minor ~ 1e-7), so we zero kmajor to read
+the minor contribution directly instead.
   * major-only : mine vs pyRTE with kminor zeroed,
-  * minor-only : (mine full - mine major) vs (pyRTE full - pyRTE major),
+  * minor-only : mine vs pyRTE with kmajor zeroed,
   * full       : mine (major + minor) vs pyRTE full.
 
 The minor reduction (drop absorbers whose gas is not in `_gas_names`) is
@@ -85,11 +90,23 @@ def test_tau_full():
         for s in ("lower", "upper")
     }
 
-    # references: full tau (major + minor), then major-only (kminor zeroed) -----
+    # deep copies of the tables to restore between the three reference runs
+    kmajor_da = go._dataset["kmajor"].copy()
+    kminor_da = {s: go._dataset[f"kminor_{s}"].copy() for s in ("lower", "upper")}
+
+    # three clean references (no subtraction): full = major + minor;
+    # major-only = kminor zeroed; minor-only = kmajor zeroed.
     tau_full_ds = go.tau_absorption(atm, interp)
+
     go._dataset["kminor_lower"] = xr.zeros_like(go._dataset["kminor_lower"])
     go._dataset["kminor_upper"] = xr.zeros_like(go._dataset["kminor_upper"])
     tau_major_ds = go.tau_absorption(atm, interp)
+
+    go._dataset["kminor_lower"] = kminor_da["lower"]
+    go._dataset["kminor_upper"] = kminor_da["upper"]
+    go._dataset["kmajor"] = xr.zeros_like(kmajor_da)
+    tau_minor_ds = go.tau_absorption(atm, interp)
+    go._dataset["kmajor"] = kmajor_da  # restore for the major stencil's capture
 
     def take(ds):
         return (
@@ -101,6 +118,7 @@ def test_tau_full():
 
     tau_full_ref = take(tau_full_ds)
     tau_major_ref = take(tau_major_ds)
+    tau_minor_ref = take(tau_minor_ds)
 
     nx, ny = len(SITES), len(EXPTS)
     nz = interp.sizes["layer"]
@@ -205,8 +223,8 @@ def test_tau_full():
         )
         tau_major_q.view[:, :, :, g] = res_q.view[:]
 
-    tau_full_q = tauq()
-    tau_full_q.view[:] = tau_major_q.view[:]  # start from major, add minor below
+    # minor accumulates into its own zeroed field (no cancellation on our side)
+    tau_minor_q = tauq()
 
     # --- minor assembly (lower then upper) -----------------------------------
     idx_h2o = go._selected_gas_names_ext.index("h2o")
@@ -270,14 +288,13 @@ def test_tau_full():
                     jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
                     kminor=kmin_pad, res=res_q,
                 )
-                tau_full_q.view[:, :, :, g] += scaling * res_q.view[:]
+                tau_minor_q.view[:, :, :, g] += scaling * res_q.view[:]
 
     run_minor("lower", 0, tropo)
     run_minor("upper", 1, ~tropo)
 
-    tau_minor_ref = tau_full_ref - tau_major_ref
-    tau_minor_mine = tau_full_q.view[:] - tau_major_q.view[:]
+    tau_full_mine = tau_major_q.view[:] + tau_minor_q.view[:]
 
     np.testing.assert_allclose(tau_major_q.view[:], tau_major_ref, rtol=1e-10, atol=1e-22)
-    np.testing.assert_allclose(tau_minor_mine, tau_minor_ref, rtol=1e-9, atol=1e-24)
-    np.testing.assert_allclose(tau_full_q.view[:], tau_full_ref, rtol=1e-9, atol=1e-22)
+    np.testing.assert_allclose(tau_minor_q.view[:], tau_minor_ref, rtol=1e-9, atol=1e-22)
+    np.testing.assert_allclose(tau_full_mine, tau_full_ref, rtol=1e-9, atol=1e-22)
