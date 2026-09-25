@@ -43,8 +43,9 @@ from pyshield.radiation.gas_optics import NGPT, interp3d_major_gpt
 # A representative column subset: correctness is per-cell independent, so a few
 # columns keep the 256 stencil launches fast while all 60 layers exercise both
 # troposphere states and the g-point loop exercises all 10 flavors.
+# Each subset needs >nhalo(=3) entries so the compute domain exceeds the halo.
 SITES = [0, 25, 50, 75]
-EXPTS = [0, 9]
+EXPTS = [0, 6, 12, 17]
 
 
 def _pyrte():
