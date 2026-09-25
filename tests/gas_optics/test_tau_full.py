@@ -141,7 +141,23 @@ def test_tau_full():
         interp["fminor"], ("eta_interp", "temp_interp", "site", "expt", "layer", "flavor")
     )
     jeta_f = sub(interp["eta_index"], ("pair", "site", "expt", "layer", "flavor"))
-    col_gas = sub(interp["gases_columns"], ("gas", "site", "expt", "layer"))  # (ngas, nx,ny,nz)
+    # Fortran gas_optical_depths_minor scales by the gas COLUMN amounts. pyRTE's
+    # tau_absorption does not read the stored interp["gases_columns"] (float32);
+    # it recomputes them fresh in float64 via
+    #   gas_name_map = self._gas_mapping
+    #   col_gas = self.get_gases_columns(atmosphere, gas_name_map)
+    #                 .sel(gas=self._selected_gas_names_ext)
+    # Reading the float32 copy leaves a ~1e-7 gap in the minor scaling; match the
+    # float64 recompute (the major path already uses float64 column_mix, hence it
+    # passed at 1e-10). Gas axis in _selected_gas_names_ext order: index 0 is the
+    # dry-air/total column used by the vmr factor, index idx_h2o below is h2o.
+    col_gas = (
+        go.get_gases_columns(atm, go._gas_mapping)
+        .sel(gas=go._selected_gas_names_ext)
+        .isel(site=SITES, expt=EXPTS)
+        .transpose("gas", "site", "expt", "layer")
+        .values
+    )  # (ngas, nx, ny, nz), float64
 
     tmplf = interp["temperature_index"].astype(float)
     pvar = atm.mapping.get_var("pres_layer")
