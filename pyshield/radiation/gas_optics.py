@@ -9,8 +9,8 @@ resident block (dynamics + moisture).
 Port order follows the Fortran kernel
 `mo_gas_optics_rrtmgp_kernels.F90`:
   1. interpolation      -> T/p indices+fractions, eta, fmajor/fminor  (this file, staged)
-  2. compute_tau_absorption -> tau (major + minor gas gathers)
-  3. compute_Planck_source  -> layer/level/surface Planck sources
+  2. compute_tau_absorption -> tau (major + minor gas gathers)         (done, validated)
+  3. compute_Planck_source  -> layer/level/surface Planck sources      (this stage)
 
 Each stage is validated against pyRTE's output (`tests/gas_optics/`), on the
 numpy backend first (correctness) then on cupy (A100 timing).
@@ -53,6 +53,26 @@ the `interpolation` routine: it turns Stage-1 `ftemp`/`fpress` and Stage-2
 `feta` into the eight `fmajor` weights the Stage-3 kmajor interpolation
 consumes and the four `fminor` weights the minor-gas 2-D interpolation
 consumes.
+
+Stage 6: the Planck sources (`compute_Planck_source`, kernels lines 567-710).
+Two device operations feed the layer/level/surface Planck emission:
+  * `pfrac` -- the fraction of each band's Planck function carried by each
+    g-point -- is `interpolate3D_byflav(one, fmajor, pfracin, ...)`: the SAME
+    8-point gather as the major-gas tau (`interp3d_major_gpt`) with the two
+    `col_mix` scalings set to 1 and the `plank_fraction` table (same
+    (14,9,60,256) layout as `kmajor`) in place of `kmajor`. No new stencil.
+  * `planck_interp1d` (new) -- the 1-D interpolation of the total-Planck table
+    `totplnk` in temperature (Fortran `interpolate1D`, lines 715-734), a
+    per-band value. Used for the surface (at tsfc and tsfc+1 for the
+    Jacobian), each layer center (tlay), and each level/interface (tlev).
+The Fortran then assembles the four outputs by elementwise combination of
+`pfrac` and these Planck values: sfc_src = pfrac(sfc_lay) * planck(tsfc);
+sfc_source_Jac = pfrac(sfc_lay) * (planck(tsfc+1) - planck(tsfc));
+lay_src = pfrac * planck(tlay); lev_src at the two boundary interfaces =
+pfrac(edge layer) * planck(tlev edge), and at interior interfaces =
+sqrt(pfrac(k-1) * pfrac(k)) * planck(tlev(k)). The assembly is elementwise
+(no table gather), driven host-side over the g-point/band loops as in the tau
+stages.
 """
 
 from ndsl.dsl.gt4py import GlobalTable, PARALLEL, computation, floor, interval, log
@@ -83,6 +103,14 @@ KMajor = GlobalTable[(Float, (14, 9, 60, 256))]
 # caller. The minor gather is a 4-point (temp x eta) interpolation.
 NMINORK = 960
 KMinor = GlobalTable[(Float, (14, 9, NMINORK))]
+
+# totplnk total-Planck table for LW_G256, Fortran layout
+# (nPlanckTemp=196, nband=16): the integrated Planck function per band at a
+# grid of temperatures. Gathered by a runtime temperature index and a runtime
+# band index in the 1-D Planck interpolation. Assert the shape in the caller.
+NPLANCKTEMP = 196
+NBND = 16
+TotPlnk = GlobalTable[(Float, (NPLANCKTEMP, NBND))]
 
 
 def interp_tp(
@@ -414,4 +442,37 @@ def interp2d_minor_gpt(
             + fmn21 * kminor.A[jtemp, je1p, kg]
             + fmn12 * kminor.A[jtp, jeta2, kg]
             + fmn22 * kminor.A[jtp, je2p, kg]
+        )
+
+
+def planck_interp1d(
+    frac: FloatField,
+    idx: IntField,
+    iband: IntField,
+    totplnk: TotPlnk,
+    planck: FloatField,
+):
+    """1-D interpolation of the total-Planck table in temperature, per band.
+
+    Port of the Fortran `interpolate1D` (kernels lines 715-734), which maps a
+    temperature to the band-integrated Planck function via a linear
+    interpolation of `totplnk` along its temperature axis:
+
+        val0  = (T - temp_ref_min) / totplnk_delta
+        i     = min(nPlanckTemp-1, max(1, int(val0)+1))   [1-based]
+        frac  = val0 - int(val0)
+        res   = totplnk(i, band) + frac * (totplnk(i+1, band) - totplnk(i, band))
+
+    The temperature-only part (val0, its floor, the clamp, and `frac`) is pure
+    float math already proven on-device in Stage 1 (`interp_tp` does
+    `floor`+clamp identically); as in the tau stages the integer index is
+    prepared on the host and passed in, so the stencil is the table gather plus
+    the linear blend. `idx` is the 0-based clamped lower temperature index
+    (Fortran `i` minus one); `frac` is the (un-clamped) fractional part; `iband`
+    is the 0-based band index (a runtime field, constant across cells per call).
+    """
+    with computation(PARALLEL), interval(...):
+        idxp = idx + 1
+        planck = totplnk.A[idx, iband] + frac * (
+            totplnk.A[idxp, iband] - totplnk.A[idx, iband]
         )
