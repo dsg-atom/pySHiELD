@@ -141,35 +141,32 @@ def test_tau_full():
         interp["fminor"], ("eta_interp", "temp_interp", "site", "expt", "layer", "flavor")
     )
     jeta_f = sub(interp["eta_index"], ("pair", "site", "expt", "layer", "flavor"))
-    # Fortran gas_optical_depths_minor scales by the gas COLUMN amounts. pyRTE's
-    # tau_absorption does not read the stored interp["gases_columns"] (float32);
-    # it recomputes them fresh in float64 via
-    #   col_gas = self.get_gases_columns(atmosphere, gas_name_map)
-    #                 .sel(gas=self._selected_gas_names_ext)
-    # where gas_name_map is the same mapping passed to interpolate (our `gm`).
-    # Reading the float32 copy leaves a ~1e-7 gap in the minor scaling; match the
-    # float64 recompute (the major path already uses float64 column_mix, hence it
-    # passed at 1e-10). The explicit .sel below fixes the gas order to
-    # _selected_gas_names_ext: index 0 is the dry-air/total column used by the
-    # vmr factor, index idx_h2o below is h2o.
-    col_gas = (
-        go.get_gases_columns(atm, gm)
-        .sel(gas=go._selected_gas_names_ext)
-        .isel(site=SITES, expt=EXPTS)
-        .transpose("gas", "site", "expt", "layer")
-        .values
-    )  # (ngas, nx, ny, nz), float64
+    # The reference kernel (compute_tau_absorption -> compiled RTE-RRTMGP Fortran)
+    # receives col_gas as the stored interp["gases_columns"] and f2py upcasts it
+    # to real(wp)=float64 for the minor scaling. gases_columns is stored float32
+    # (dumped), so feed those SAME float32-rounded values upcast to float64 -- the
+    # exact bytes the Fortran sees. A fresh get_gases_columns is NOT equivalent:
+    # its pre-downcast float64 values differ from the float32 copy. Gas axis is in
+    # _selected_gas_names_ext order (index 0 = dry-air/total for the vmr factor;
+    # idx_h2o below is h2o), the same convention get_idx_minor returns.
+    col_gas = sub(interp["gases_columns"], ("gas", "site", "expt", "layer")).astype(
+        np.float64
+    )  # (ngas, nx, ny, nz)
 
     tmplf = interp["temperature_index"].astype(float)
     pvar = atm.mapping.get_var("pres_layer")
     tvar = atm.mapping.get_var("temp_layer")
+    # play/tlay are stored float32 (dumped); the Fortran upcasts them to float64
+    # and evaluates the density factor 0.01*play/tlay in float64. Upcast here too:
+    # numpy keeps a Python-float * float32-array product in float32, which rounded
+    # the density factor to float32 and was the ~1e-7 minor-tau gap.
     play = (
         atm[pvar].broadcast_like(tmplf).isel(site=SITES, expt=EXPTS)
-        .transpose("site", "expt", "layer").values
+        .transpose("site", "expt", "layer").values.astype(np.float64)
     )
     tlay = (
         atm[tvar].broadcast_like(tmplf).isel(site=SITES, expt=EXPTS)
-        .transpose("site", "expt", "layer").values
+        .transpose("site", "expt", "layer").values.astype(np.float64)
     )
 
     gpoint_flavor = go.gpoint_flavor.transpose("gpt", "atmos_layer").values  # (ngpt,2) 1-based
