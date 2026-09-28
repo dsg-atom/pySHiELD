@@ -10,7 +10,8 @@ Port order follows the Fortran kernel
 `mo_gas_optics_rrtmgp_kernels.F90`:
   1. interpolation      -> T/p indices+fractions, eta, fmajor/fminor  (this file, staged)
   2. compute_tau_absorption -> tau (major + minor gas gathers)         (done, validated)
-  3. compute_Planck_source  -> layer/level/surface Planck sources      (this stage)
+  3. compute_Planck_source  -> layer/level/surface Planck sources      (done, validated)
+  4. compute_tau_rayleigh   -> shortwave Rayleigh scattering tau       (this stage)
 
 Each stage is validated against pyRTE's output (`tests/gas_optics/`), on the
 numpy backend first (correctness) then on cupy (A100 timing).
@@ -73,6 +74,22 @@ pfrac(edge layer) * planck(tlev edge), and at interior interfaces =
 sqrt(pfrac(k-1) * pfrac(k)) * planck(tlev(k)). The assembly is elementwise
 (no table gather), driven host-side over the g-point/band loops as in the tau
 stages.
+
+Stage 7 (here): the shortwave Rayleigh scattering optical depth
+(`compute_tau_rayleigh`, kernels lines 507-564). The Rayleigh coefficient
+`krayl` gather is `interpolate2D_byflav` -- the SAME 4-point (temp x eta, no
+pressure) interpolation as the minor-gas gather (`interp2d_minor_gpt`), applied
+to the `krayl` table (Fortran (temperature=14, eta=9, gpt=224, 2); the last
+axis selects the lower/upper troposphere half by the cell's `tropo` flag). The
+only difference from the minor gather is the table's g-point axis size (224,
+the SW g-points, vs the minor contributor axis), so `interp2d_rayl_gpt` is
+`interp2d_minor_gpt` with the `KRayl` alias. tau_rayleigh(g) = k(g) *
+(col_h2o + col_dry). The shortwave optical properties then combine as
+tau = tau_absorption + tau_rayleigh; ssa = tau_rayleigh / tau (0 where
+tau <= 2*tiny); g = 0 -- an elementwise host combine (Fortran
+`combine_abs_and_rayleigh`), no stencil. The top-of-atmosphere solar source
+(`toa_source`) is a per-column broadcast of the per-g-point `solar_source`
+vector, also host-side, handled where the port is wired into `rte_rrtmgp.py`.
 """
 
 from ndsl.dsl.gt4py import GlobalTable, PARALLEL, computation, floor, interval, log
@@ -83,6 +100,11 @@ from ndsl.dsl.typing import Float, FloatField, IntField
 # quantity_factory.add_data_dimensions({"gpt": NGPT}) and fills one g-point
 # slice per stencil call.
 NGPT = 256
+
+# Number of shortwave g-points (SW_G224). The shortwave tables carry 224
+# g-points where the longwave ones carry 256; only the g-point axis size
+# differs, so the same gather stencils serve both with a SW-shaped table alias.
+NGPT_SW = 224
 
 # vmr_ref reference table, Fortran layout (atmos_layer=2, absorber_ext=20,
 # temperature=14) for the LW_G256 coefficient file. GlobalTable has no spatial
@@ -103,6 +125,14 @@ KMajor = GlobalTable[(Float, (14, 9, 60, 256))]
 # caller. The minor gather is a 4-point (temp x eta) interpolation.
 NMINORK = 960
 KMinor = GlobalTable[(Float, (14, 9, NMINORK))]
+
+# krayl Rayleigh-coefficient table for one troposphere half, Fortran layout
+# (temperature=14, eta=9, gpt=224) for SW_G224. Same (temp x eta, no pressure)
+# layout as kminor, so `interp2d_rayl_gpt` gathers it exactly as the minor
+# gather does; the caller passes the lower or upper half (krayl(:,:,:,itropo))
+# and selects between them by the cell's tropopause flag. Assert the shape in
+# the caller.
+KRayl = GlobalTable[(Float, (14, 9, NGPT_SW))]
 
 # totplnk total-Planck table for LW_G256, Fortran layout
 # (nPlanckTemp=196, nband=16): the integrated Planck function per band at a
@@ -442,6 +472,44 @@ def interp2d_minor_gpt(
             + fmn21 * kminor.A[jtemp, je1p, kg]
             + fmn12 * kminor.A[jtp, jeta2, kg]
             + fmn22 * kminor.A[jtp, je2p, kg]
+        )
+
+
+def interp2d_rayl_gpt(
+    fmn11: FloatField,
+    fmn21: FloatField,
+    fmn12: FloatField,
+    fmn22: FloatField,
+    jtemp: IntField,
+    jeta1: IntField,
+    jeta2: IntField,
+    kg: IntField,
+    krayl: KRayl,
+    res: FloatField,
+):
+    """Rayleigh 4-point interpolation of the krayl table, one g-point per call.
+
+    Port of the Fortran `interpolate2D_byflav` inner expression used by
+    `compute_tau_rayleigh` (kernels lines 507-564): identical to the minor-gas
+    gather (`interp2d_minor_gpt`) -- a 2 x 2 interpolation over the two eta
+    brackets and the two temperature brackets, no pressure dependence -- but on
+    the SW `krayl` table (g-point axis 224). `krayl` here is one troposphere
+    half (Fortran krayl(:,:,:,itropo)); the caller runs this once with the lower
+    half and once with the upper half and selects per cell by the tropopause
+    flag. `fmn<eta-level><temp-level>` are the four `fminor` weights and
+    `jeta1`/`jeta2` the eta lower brackets for the flavor of this cell's g-point
+    and troposphere half. `kg` is the 0-based g-point index. Integer inputs are
+    0-based (Fortran index minus one).
+    """
+    with computation(PARALLEL), interval(...):
+        jtp = jtemp + 1
+        je1p = jeta1 + 1
+        je2p = jeta2 + 1
+        res = (
+            fmn11 * krayl.A[jtemp, jeta1, kg]
+            + fmn21 * krayl.A[jtemp, je1p, kg]
+            + fmn12 * krayl.A[jtp, jeta2, kg]
+            + fmn22 * krayl.A[jtp, je2p, kg]
         )
 
 
