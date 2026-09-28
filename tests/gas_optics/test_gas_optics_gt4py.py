@@ -13,8 +13,9 @@ stencil tile and back, vars re-inserted in the container's dim order -- not just
 the numerics, which the kernel tests already pin.
 
 Both shortwave (SW_G224, TWO_STREAM) and longwave (LW_G256, ABSORPTION) are
-exercised. `toa_source` is left on pyRTE's value by the class, so it matches
-exactly. A 4x4 RFMIP subset (4 sites x 4 experiments) folds to a (4, 4) tile.
+exercised. `toa_source` is now reproduced by the class from the solar-source
+coefficient tables (mirroring pyRTE `compute_sources`), so it too is compared.
+A 4x4 RFMIP subset (4 sites x 4 experiments) folds to a (4, 4) tile.
 
 Run on Discover inside the fork-a venv with XDG_CACHE_HOME set:
     pytest tests/gas_optics/test_gas_optics_gt4py.py -q
@@ -71,7 +72,7 @@ _TOL = {
     "tau": dict(rtol=1e-9, atol=1e-22),
     "ssa": dict(rtol=1e-8, atol=1e-25),
     "g": dict(rtol=0, atol=0),
-    "toa_source": dict(rtol=0, atol=0),  # untouched by the class -> exact
+    "toa_source": dict(rtol=1e-12, atol=1e-30),  # class-reproduced solar source
     "surface_source": dict(rtol=1e-10, atol=1e-22),
     "layer_source": dict(rtol=1e-10, atol=1e-22),
     "level_source": dict(rtol=1e-10, atol=1e-22),

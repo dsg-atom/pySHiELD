@@ -22,9 +22,12 @@ Output vars overwritten:
     longwave  (ABSORPTION)  tau, surface_source, layer_source,
                             level_source, surface_source_jacobian
 
-`toa_source` (shortwave) is a host-side per-column broadcast of the solar-source
-vector with no device kernel; it is left on pyRTE's value for now and ported
-into this class later.
+`toa_source` (shortwave) has no device kernel -- it is a host broadcast of the
+TSI-normalized per-g-point solar-source vector -- so it is reproduced here in
+xarray straight from the solar-source coefficient tables (`_toa_source`),
+mirroring pyRTE `compute_sources`. Unlike the gather vars its non-core dims are
+whatever `total_solar_irradiance` carries (per-site for RFMIP), not the full
+column set, so it is written outside the (nx, ny) tile machinery.
 
 The gather assembly here is the same code proven in tests/gas_optics
 (test_tau_full.py / test_tau_full_sw.py, test_sw.py, test_planck.py); the only
@@ -247,6 +250,45 @@ class GasOpticsGT4Py:
         idx0 = np.clip(iv, 0, nplancktemp - 2).astype(np.int64)
         return idx0, frac
 
+    def _toa_source(self, atmosphere, base):
+        """Reproduce pyRTE `SWGasOptics.compute_sources` -> toa_source.
+
+        Host glue, no device kernel: the per-g-point solar-source vector is
+        combined from its quiet/facular/sunspot coefficient tables (the two
+        magnetic offsets are the pyRTE constants), then either scaled to a
+        supplied `total_solar_irradiance` per column or normalized to the
+        default TSI and broadcast over the non-core column dims. This mirrors
+        pyRTE exactly and overwrites base["toa_source"] in place; it is written
+        against toa_source's OWN dims (whatever `total_solar_irradiance` carries,
+        e.g. per-site for RFMIP), which are a subset of the gather vars' non-core
+        dims, so it does not use the (nx, ny) tile machinery.
+        """
+        a_offset = 0.1495954
+        b_offset = 0.00066696
+        ds = self._pyrte._dataset
+        solar_source = (
+            ds["solar_source_quiet"]
+            + (ds["mg_default"] - a_offset) * ds["solar_source_facular"]
+            + (ds["sb_default"] - b_offset) * ds["solar_source_sunspot"]
+        )
+        if "total_solar_irradiance" in atmosphere:
+            tsi = atmosphere["total_solar_irradiance"]
+            toa_flux = solar_source.broadcast_like(tsi)
+            def_tsi = toa_flux.sum(dim="gpt")
+            toa = (toa_flux * (tsi / def_tsi)).rename("toa_source")
+        else:
+            norm = 1.0 / solar_source.sum(dim="gpt")
+            toa = (solar_source * ds["tsi_default"] * norm).rename("toa_source")
+            non_default = [
+                d
+                for d in atmosphere.dims
+                if d not in (self._layer_dim, self._level_dim, "gpt")
+            ]
+            for dim in non_default:
+                toa = toa.expand_dims({dim: atmosphere[dim]})
+        dst = base["toa_source"]
+        base["toa_source"] = dst.copy(data=toa.transpose(*dst.dims).values)
+
     # ----------------------------------------------------------------- driver
     def compute(
         self,
@@ -291,7 +333,7 @@ class GasOpticsGT4Py:
             self._write(base, "tau", tau, [layer_dim, "gpt"])
             self._write(base, "ssa", ssa, [layer_dim, "gpt"])
             self._write(base, "g", g, [layer_dim, "gpt"])
-            # toa_source left on pyRTE's value (host glue, no device kernel).
+            self._toa_source(atmosphere, base)
         else:
             self._write(base, "tau", tau_abs, [layer_dim, "gpt"])
             sfc, lay, lev, jac = self._planck(atmosphere, interp, base)
