@@ -4,7 +4,7 @@ import numpy as np
 from pyrte_rrtmgp import rte
 from pyrte_rrtmgp.config import DEFAULT_DIM_MAPPING
 from pyrte_rrtmgp.input_mapping import AtmosphericMapping
-from pyrte_rrtmgp.rrtmgp import CloudOptics, GasOptics
+from pyrte_rrtmgp.rrtmgp import CloudOptics
 from pyrte_rrtmgp.rrtmgp_data_files import CloudOpticsFiles, GasOpticsFiles
 
 import ndsl.constants as constants
@@ -17,6 +17,7 @@ from ndsl.dsl.typing import Bool, Float, FloatField, FloatFieldIJ
 from pyshield.stencils.surface import SurfaceState
 
 from ._config import RTE_RRTMGPConfig
+from .gas_optics_gt4py import GasOpticsGT4Py
 from .rad_astro import coszmn, sol_init, solar_update
 from .rad_clouds import cld_init, progcld4, progcld5
 from .rad_gases import co2_update, gas_init, get_gases_bottomup, get_gases_topdown
@@ -285,10 +286,31 @@ class RTE_RRTMGPDriver:
         self._llyr = cld_init(sigma, config.ivflip)
 
         self._cloud_optics_lw = CloudOptics(cloud_optics_file=CloudOpticsFiles.LW_BND)
-        self._gas_optics_lw = GasOptics(gas_optics_file=GasOpticsFiles.LW_G256)
-
         self._cloud_optics_sw = CloudOptics(cloud_optics_file=CloudOpticsFiles.SW_BND)
-        self._gas_optics_sw = GasOptics(gas_optics_file=GasOpticsFiles.SW_G224)
+
+        # Gas optics: GT4Py gather core (drop-in for pyRTE GasOptics). The class
+        # keeps pyRTE's interpolate + RTE solve and replaces only the per-g-point
+        # table-gather core with the validated GT4Py stencils. It folds the
+        # flattened radx "column" axis into an (nx, ny) compute tile, so it needs
+        # the local compute dims and the framework backend. radx is the compute
+        # domain with halos/padding removed (state.to_rterrtmgp_xr), so its column
+        # count is nic*njc = domain_compute()[:2] and its layer count is npz.
+        nx, ny, nz = grid_indexing.domain_compute()
+        gas_optics_backend = quantity_factory.backend
+        self._gas_optics_lw = GasOpticsGT4Py(
+            gas_optics_file=GasOpticsFiles.LW_G256,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=gas_optics_backend,
+        )
+        self._gas_optics_sw = GasOpticsGT4Py(
+            gas_optics_file=GasOpticsFiles.SW_G224,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=gas_optics_backend,
+        )
         self._gas_mapping = {
             "h2o": "qvapor",
             "o3": "qo3mr",
