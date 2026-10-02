@@ -172,8 +172,16 @@ def test_sw_solver_gt4py():
             bb_dir, ref_dir, rtol=1e-10, atol=1e-12, err_msg="sw_flux_dir"
         )
 
-    # sanity: real, physical shortwave flux.
+    # sanity: finite everywhere.
     assert np.all(np.isfinite(bb_up)) and np.all(np.isfinite(bb_dn))
-    assert np.all(bb_up >= 0.0) and np.all(bb_dn >= 0.0)
+    # Non-negativity holds only for DAYTIME columns. RFMIP's global sites include
+    # nighttime (solar_zenith_angle > 90 deg => mu0 < 0), where RTE-RRTMGP sets the
+    # top direct beam to inc_flux_dir*mu0 < 0 by design and propagates it downward;
+    # pyRTE produces the identical negative, so the rtol-1e-10 allclose above
+    # already confirms the port matches it. Check physical non-negativity (within
+    # round-off) only where mu0 > 0.
+    day = np.broadcast_to((mu0 > 0.0)[:, :, None], bb_up.shape)
+    assert np.all(bb_up[day] >= -1e-6), bb_up[day].min()
+    assert np.all(bb_dn[day] >= -1e-6), bb_dn[day].min()
     # downward total >= direct, and both >= 0
     assert np.all(bb_dn + 1e-9 >= bb_dir)
