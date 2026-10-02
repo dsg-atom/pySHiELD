@@ -139,7 +139,15 @@ def test_sw_solver_gt4py():
     tau = _tile(sw["tau"], noncore, [layer_dim, "gpt"], nx, ny)
     ssa = _tile(sw["ssa"], noncore, [layer_dim, "gpt"], nx, ny)
     gg = _tile(sw["g"], noncore, [layer_dim, "gpt"], nx, ny)
-    inc_dir = _tile(sw["toa_source"], noncore, ["gpt"], nx, ny)
+    # toa_source follows total_solar_irradiance's dims (RFMIP: site-only), so it
+    # can lack some non-core dims (e.g. expt). Broadcast it to the full noncore set
+    # before tiling -- the same way pyRTE's own solve broadcasts it against the
+    # atmosphere -- using the expand_dims pattern used for mu0/albedo above.
+    toa_da = sw["toa_source"]
+    for d in noncore:
+        if d not in toa_da.dims:
+            toa_da = toa_da.expand_dims({d: sw[d]})
+    inc_dir = _tile(toa_da, noncore, ["gpt"], nx, ny)
     mu0 = _col(sw["mu0"], noncore, nx, ny)
     alb = _col(sw["surface_albedo"], noncore, nx, ny)
     alb_gpt = np.repeat(alb[:, :, None], ngpt, axis=2)
