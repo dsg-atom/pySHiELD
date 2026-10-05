@@ -57,8 +57,11 @@ class CloudOpticsGT4Py:
     """pyRTE `CloudOptics` with the LUT gather + increment replaced by GT4Py."""
 
     def __init__(
-        self, cloud_optics_file, nx, ny, nz, backend, nhalo=3, ice_roughness=0
+        self, cloud_optics_file, nx, ny, nz, backend, nhalo=3, ice_roughness=1
     ):
+        # pyRTE's CloudOptics.compute hardcodes ice_roughness = 1 (middle of the
+        # 3 nrghice categories) when slicing extice/ssaice/asyice, so default to
+        # 1 to match the reference.
         self._pyrte = CloudOptics(cloud_optics_file=cloud_optics_file)
         self.nx, self.ny, self.nz = int(nx), int(ny), int(nz)
         self._backend = backend
