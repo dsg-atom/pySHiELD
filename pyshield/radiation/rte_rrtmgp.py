@@ -793,6 +793,57 @@ class RTE_RRTMGPDriver:
             inc_flux_dir=inc_dir,
         )
 
+    def _solve_sw_allsky(self, sw_optics):
+        """All-sky shortwave broadband fluxes via the GT4Py two-stream solver.
+
+        Identical extraction and solver call to `_solve_sw_clear`, but invoked
+        AFTER `self._cloud_optics_sw.add_to` has folded the cloud optics into
+        `sw_optics` in place, so tau/ssa/g here are the COMBINED gas+cloud optics
+        (asymmetry g != 0). The SAME validated SWTwoStreamSolverGT4Py handles
+        both -- the only difference is the cloud-laden input. Validated on g != 0
+        by tests/rte_solver/test_sw_solver_allsky_gt4py.py. Returns broadband
+        (up, down, direct), each (nx, ny, nlev); `down` is the total flux.
+        """
+        nx, ny = self._nx, self._ny
+        layer_dim = sw_optics.mapping.get_dim("layer")
+        level_dim = sw_optics.mapping.get_dim("level")
+        assert bool(sw_optics.attrs["top_at_1"]) == self._solver_top_at_1, (
+            "SW gas-optics vertical ordering (top_at_1="
+            f"{bool(sw_optics.attrs['top_at_1'])}) does not match the compiled "
+            f"solver assumption (top_at_1={self._solver_top_at_1})"
+        )
+        noncore = [
+            d for d in sw_optics["tau"].dims if d not in (layer_dim, level_dim, "gpt")
+        ]
+        ngpt = int(sw_optics.sizes["gpt"])
+
+        tau = _tile(sw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
+        ssa = _tile(sw_optics["ssa"], noncore, [layer_dim, "gpt"], nx, ny)
+        gg = _tile(sw_optics["g"], noncore, [layer_dim, "gpt"], nx, ny)
+
+        # toa_source follows total_solar_irradiance's dims and may lack some
+        # non-core dims; broadcast it over the full non-core set before tiling,
+        # the same way _solve_sw_clear and the SW test do.
+        toa_da = sw_optics["toa_source"]
+        for d in noncore:
+            if d not in toa_da.dims:
+                toa_da = toa_da.expand_dims({d: int(sw_optics.sizes[d])})
+        inc_dir = _tile(toa_da, noncore, ["gpt"], nx, ny)
+
+        mu0 = _col(sw_optics["mu0"], noncore, nx, ny)
+        alb = _col(sw_optics["surface_albedo"], noncore, nx, ny)
+        alb_gpt = np.repeat(alb[:, :, None], ngpt, axis=2)
+
+        return self._sw_solver.solve(
+            tau=tau,
+            ssa=ssa,
+            g=gg,
+            mu0=mu0,
+            sfc_alb_dir=alb_gpt,
+            sfc_alb_dif=alb_gpt,
+            inc_flux_dir=inc_dir,
+        )
+
     def _solve_lw_clear(self, lw_optics):
         """Clear-sky longwave broadband fluxes via the GT4Py no-scattering solver.
 
@@ -888,12 +939,14 @@ class RTE_RRTMGPDriver:
         self._cloud_optics_sw.add_to(
             sw_optics, sw_cloud_optical_props, self._gpt2band_sw
         )
-        # TODO: all-sky SW solve stays on pyRTE until a cloud-consuming GT4Py
-        # solver exists (the clear-sky GT4Py two-stream solver above does not
-        # consume cloud optics).
-        fluxes_sw = sw_optics.rte.solve(add_to_input=False)
-        state.fswd.view[:] = fluxes_sw.sw_flux_down[:].reshape(state.fswd.view[:].shape)
-        state.fswu.view[:] = fluxes_sw.sw_flux_up[:].reshape(state.fswu.view[:].shape)
+        # All-sky SW solve: the SAME validated GT4Py two-stream solver, now fed
+        # the COMBINED gas+cloud optics (add_to above mutated sw_optics in place,
+        # so tau/ssa/g carry real cloud asymmetry g != 0). Validated on g != 0 by
+        # tests/rte_solver/test_sw_solver_allsky_gt4py.py. Replaces the former
+        # pyRTE sw_optics.rte.solve(add_to_input=False).
+        bb_up_sw_all, bb_dn_sw_all, _bb_dir_sw_all = self._solve_sw_allsky(sw_optics)
+        state.fswd.view[:] = bb_dn_sw_all.reshape(state.fswd.view[:].shape)
+        state.fswu.view[:] = bb_up_sw_all.reshape(state.fswu.view[:].shape)
 
         # And do LW fluxes
         lw_optics = self._gas_optics_lw.compute(
