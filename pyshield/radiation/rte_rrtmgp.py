@@ -4,7 +4,6 @@ import numpy as np
 from pyrte_rrtmgp import rte
 from pyrte_rrtmgp.config import DEFAULT_DIM_MAPPING
 from pyrte_rrtmgp.input_mapping import AtmosphericMapping
-from pyrte_rrtmgp.rrtmgp import CloudOptics
 from pyrte_rrtmgp.rrtmgp_data_files import CloudOpticsFiles, GasOpticsFiles
 
 import ndsl.constants as constants
@@ -17,6 +16,7 @@ from ndsl.dsl.typing import Bool, Float, FloatField, FloatFieldIJ
 from pyshield.stencils.surface import SurfaceState
 
 from ._config import RTE_RRTMGPConfig
+from .cloud_optics_gt4py import CloudOpticsGT4Py
 from .gas_optics_gt4py import GasOpticsGT4Py
 from .lw_solver_gt4py import LWNoScatSolverGT4Py
 from .sw_solver_gt4py import SWTwoStreamSolverGT4Py
@@ -311,9 +311,6 @@ class RTE_RRTMGPDriver:
         # Init clouds:
         self._llyr = cld_init(sigma, config.ivflip)
 
-        self._cloud_optics_lw = CloudOptics(cloud_optics_file=CloudOpticsFiles.LW_BND)
-        self._cloud_optics_sw = CloudOptics(cloud_optics_file=CloudOpticsFiles.SW_BND)
-
         # Gas optics: GT4Py gather core (drop-in for pyRTE GasOptics). The class
         # keeps pyRTE's interpolate + RTE solve and replaces only the per-g-point
         # table-gather core with the validated GT4Py stencils. It folds the
@@ -336,6 +333,37 @@ class RTE_RRTMGPDriver:
             ny=ny,
             nz=nz,
             backend=gas_optics_backend,
+        )
+
+        # Cloud optics: GT4Py LUT gather + band->g-point increment (drop-in for
+        # the pyRTE CloudOptics compute + rte.add_to). Built once here, reusing
+        # the SAME nx, ny, nz and backend as the gas optics / solvers above.
+        # Default ice_roughness=1 matches pyRTE's hardcoded extice/ssaice/asyice
+        # slice, so it is NOT overridden.
+        self._cloud_optics_lw = CloudOpticsGT4Py(
+            cloud_optics_file=CloudOpticsFiles.LW_BND,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=gas_optics_backend,
+        )
+        self._cloud_optics_sw = CloudOpticsGT4Py(
+            cloud_optics_file=CloudOpticsFiles.SW_BND,
+            nx=nx,
+            ny=ny,
+            nz=nz,
+            backend=gas_optics_backend,
+        )
+        # Precompute the 0-based (ngpt,) g-point->band maps once from the
+        # gas-optics coefficient datasets' bnd_limits_gpt (shape (2, nbnd),
+        # 1-based inclusive start/end per band). CloudOpticsGT4Py.add_to needs
+        # this explicit map (unlike pyRTE's rte.add_to, which derives it from the
+        # optical-props object itself).
+        self._gpt2band_sw = CloudOpticsGT4Py.gpt2band_from_limits(
+            self._band_limits_gpt(self._gas_optics_sw)
+        )
+        self._gpt2band_lw = CloudOpticsGT4Py.gpt2band_from_limits(
+            self._band_limits_gpt(self._gas_optics_lw)
         )
 
         # Clear-sky RTE solvers: validated GT4Py ports (drop-in for the
@@ -470,6 +498,25 @@ class RTE_RRTMGPDriver:
             origin=grid_indexing.origin_compute(),
             domain=grid_indexing.domain_compute(),
         )
+
+    @staticmethod
+    def _band_limits_gpt(gas_optics):
+        """pyRTE gas-optics bnd_limits_gpt as (2, nbnd), 1-based start/end.
+
+        GasOpticsGT4Py keeps the pyRTE gas optics at `._pyrte`, whose raw
+        coefficient dataset is `._dataset` -- the same attribute GasOpticsGT4Py
+        itself reads `bnd_limits_gpt` from (see gas_optics_gt4py.py). The lookup
+        is guarded so a Discover run surfaces the real name if pyRTE renames it,
+        rather than failing obscurely.
+        """
+        ds = getattr(getattr(gas_optics, "_pyrte", None), "_dataset", None)
+        if ds is None or "bnd_limits_gpt" not in ds:
+            raise AttributeError(
+                "could not find bnd_limits_gpt on the pyRTE gas-optics dataset "
+                "(expected gas_optics._pyrte._dataset['bnd_limits_gpt']); "
+                "confirm the attribute name against the installed pyRTE"
+            )
+        return ds["bnd_limits_gpt"].transpose("pair", "bnd").values
 
     def _accumulate_radiation_inputs(
         self, state: RTE_RRTMGPState, sfc_state: SurfaceState, sdate: datetime.datetime
@@ -833,9 +880,17 @@ class RTE_RRTMGPDriver:
             add_to_input=False,
             variable_mapping=self._atm_map,
         )
-        sw_cloud_optical_props.rte.add_to(sw_optics)
-        # TODO: all-sky SW solve stays on pyRTE until cloud optics is ported to
-        # GT4Py (the clear-sky GT4Py solver above does not consume cloud optics).
+        # Fold the by-band GT4Py cloud optics into the by-g-point gas optics in
+        # place (replaces pyRTE's sw_cloud_optical_props.rte.add_to(sw_optics);
+        # the GT4Py add_to needs the explicit g-point->band map). This runs AFTER
+        # the clear-sky solve above has read the gas-only optics, so it does not
+        # retroactively change the clear-sky result.
+        self._cloud_optics_sw.add_to(
+            sw_optics, sw_cloud_optical_props, self._gpt2band_sw
+        )
+        # TODO: all-sky SW solve stays on pyRTE until a cloud-consuming GT4Py
+        # solver exists (the clear-sky GT4Py two-stream solver above does not
+        # consume cloud optics).
         fluxes_sw = sw_optics.rte.solve(add_to_input=False)
         state.fswd.view[:] = fluxes_sw.sw_flux_down[:].reshape(state.fswd.view[:].shape)
         state.fswu.view[:] = fluxes_sw.sw_flux_up[:].reshape(state.fswu.view[:].shape)
@@ -861,9 +916,16 @@ class RTE_RRTMGPDriver:
             add_to_input=False,
             variable_mapping=self._atm_map,
         )
-        lw_cloud_optical_props.rte.add_to(lw_optics)
-        # TODO: all-sky LW solve stays on pyRTE until cloud optics is ported to
-        # GT4Py; the all-sky LW path may also need the rescaling that the
+        # Fold the by-band GT4Py cloud optics into the by-g-point gas optics in
+        # place (replaces pyRTE's lw_cloud_optical_props.rte.add_to(lw_optics);
+        # the GT4Py add_to needs the explicit g-point->band map). This runs AFTER
+        # the clear-sky solve above has read the gas-only optics, so it does not
+        # retroactively change the clear-sky result.
+        self._cloud_optics_lw.add_to(
+            lw_optics, lw_cloud_optical_props, self._gpt2band_lw
+        )
+        # TODO: all-sky LW solve stays on pyRTE until a cloud-consuming GT4Py
+        # solver exists; the all-sky LW path may also need the rescaling that the
         # clear-sky GT4Py no-scattering solver does not implement.
         fluxes_lw = lw_optics.rte.solve(add_to_input=False)
 
