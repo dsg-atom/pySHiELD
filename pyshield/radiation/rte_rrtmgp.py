@@ -890,6 +890,56 @@ class RTE_RRTMGPDriver:
             sfc_emis=emis,
         )
 
+    def _solve_lw_allsky(self, lw_optics):
+        """All-sky longwave broadband fluxes via the GT4Py no-scattering solver.
+
+        Identical extraction and solver call to `_solve_lw_clear`, but invoked
+        AFTER `self._cloud_optics_lw.add_to` has folded the cloud optics into
+        `lw_optics` in place. The LW path runs in ABSORPTION mode (1scl): both
+        gas optics and cloud optics produce TAU ONLY, and `add_to` increments
+        tau and leaves the Planck sources (layer/level/surface) untouched. So the
+        all-sky LW solve is pure no-scattering on cloud-absorption-augmented tau
+        plus the unchanged gas Planck sources -- there is NO rescaling and NO new
+        solver. The SAME validated LWNoScatSolverGT4Py handles both; the only
+        difference is the cloud-augmented tau. Validated by
+        tests/rte_solver/test_lw_solver_allsky_gt4py.py. Returns broadband
+        (up, down), each (nx, ny, nlev).
+        """
+        nx, ny = self._nx, self._ny
+        layer_dim = lw_optics.mapping.get_dim("layer")
+        level_dim = lw_optics.mapping.get_dim("level")
+        assert bool(lw_optics.attrs["top_at_1"]) == self._solver_top_at_1, (
+            "LW gas-optics vertical ordering (top_at_1="
+            f"{bool(lw_optics.attrs['top_at_1'])}) does not match the compiled "
+            f"solver assumption (top_at_1={self._solver_top_at_1})"
+        )
+        noncore = [
+            d for d in lw_optics["tau"].dims if d not in (layer_dim, level_dim, "gpt")
+        ]
+        ngpt = int(lw_optics.sizes["gpt"])
+
+        # tau is the COMBINED gas+cloud absorption tau (add_to mutated it in
+        # place); the Planck sources are unchanged from the clear-sky solve.
+        tau = _tile(lw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
+        lay = _tile(lw_optics["layer_source"], noncore, [layer_dim, "gpt"], nx, ny)
+        lev = _tile(lw_optics["level_source"], noncore, [level_dim, "gpt"], nx, ny)
+        sfc = _tile(lw_optics["surface_source"], noncore, ["gpt"], nx, ny)
+
+        emis_da = lw_optics["surface_emissivity"]
+        if "gpt" in emis_da.dims:
+            emis = _tile(emis_da, noncore, ["gpt"], nx, ny)
+        else:
+            emis_col = _col(emis_da, noncore, nx, ny)
+            emis = np.repeat(emis_col[:, :, None], ngpt, axis=2)
+
+        return self._lw_solver.solve(
+            tau=tau,
+            lay_source=lay,
+            lev_source=lev,
+            sfc_src=sfc,
+            sfc_emis=emis,
+        )
+
     def step_radiation(
         self, state: RTE_RRTMGPState, sfc_state: SurfaceState, date: datetime.datetime
     ):
@@ -977,13 +1027,16 @@ class RTE_RRTMGPDriver:
         self._cloud_optics_lw.add_to(
             lw_optics, lw_cloud_optical_props, self._gpt2band_lw
         )
-        # TODO: all-sky LW solve stays on pyRTE until a cloud-consuming GT4Py
-        # solver exists; the all-sky LW path may also need the rescaling that the
-        # clear-sky GT4Py no-scattering solver does not implement.
-        fluxes_lw = lw_optics.rte.solve(add_to_input=False)
-
-        state.flwd.view[:] = fluxes_lw.lw_flux_down[:].reshape(state.flwd.view[:].shape)
-        state.flwu.view[:] = fluxes_lw.lw_flux_up[:].reshape(state.flwu.view[:].shape)
+        # All-sky LW solve: the SAME validated GT4Py no-scattering solver, now fed
+        # the COMBINED gas+cloud absorption tau (add_to above mutated lw_optics in
+        # place). The LW path is ABSORPTION (1scl): cloud optics is tau-only, so
+        # add_to increments tau and leaves the Planck sources untouched -- NO
+        # rescaling, NO new solver needed. Validated by
+        # tests/rte_solver/test_lw_solver_allsky_gt4py.py. Replaces the former
+        # pyRTE lw_optics.rte.solve(add_to_input=False).
+        bb_up_lw_all, bb_dn_lw_all = self._solve_lw_allsky(lw_optics)
+        state.flwd.view[:] = bb_dn_lw_all.reshape(state.flwd.view[:].shape)
+        state.flwu.view[:] = bb_up_lw_all.reshape(state.flwu.view[:].shape)
 
         self._calc_net_flux_and_heating(
             state.fswu,
