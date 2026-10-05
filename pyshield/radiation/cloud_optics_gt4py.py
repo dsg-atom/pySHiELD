@@ -77,8 +77,9 @@ class CloudOpticsGT4Py:
         # LUT constants + step sizes (Fortran load_lut).
         self.radliq_lwr = float(self._var(ds, "radliq_lwr"))
         self.radliq_upr = float(self._var(ds, "radliq_upr"))
-        self.radice_lwr = float(self._var(ds, "radice_lwr"))
-        self.radice_upr = float(self._var(ds, "radice_upr"))
+        # Ice LUT is indexed by effective DIAMETER (diamice_*); liquid by radius.
+        self.radice_lwr = float(self._var(ds, "diamice_lwr", "radice_lwr"))
+        self.radice_upr = float(self._var(ds, "diamice_upr", "radice_upr"))
         self.liq_step = (self.radliq_upr - self.radliq_lwr) / (self.nsize_liq - 1)
         self.ice_step = (self.radice_upr - self.radice_lwr) / (self.nsize_ice - 1)
 
@@ -116,7 +117,7 @@ class CloudOpticsGT4Py:
     # --------------------------------------------------------- table loading
     def _coeff_dataset(self):
         """The raw cloud-coefficient dataset pyRTE loaded (like GasOptics)."""
-        for attr in ("_dataset", "_cloud_optics", "dataset"):
+        for attr in ("_ds", "_dataset", "_cloud_optics", "dataset"):
             ds = getattr(self._pyrte, attr, None)
             if ds is not None and hasattr(ds, "sizes"):
                 return ds
