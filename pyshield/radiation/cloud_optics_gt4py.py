@@ -183,7 +183,16 @@ class CloudOpticsGT4Py:
         return self._qf.zeros([I_DIM, J_DIM, K_DIM], "", dtype=Int)
 
     def _tile(self, da, rest):
-        """DataArray -> (nx, ny, *rest), folding the non-core column dims."""
+        """DataArray -> (nx, ny, *rest), folding the non-core column dims.
+
+        Cloud input fields (lwp/iwp/rel/rei) may lack some non-core dims (e.g. a
+        site-only cloud state with no `expt`); broadcast over the missing ones,
+        exactly as pyRTE's own compute broadcasts the cloud inputs against the
+        atmosphere, so the fold matches the reference.
+        """
+        for d in self._noncore:
+            if d not in da.dims:
+                da = da.expand_dims({d: self._noncore_sizes[d]})
         arr = da.transpose(*self._noncore, *rest).values
         rest_shape = tuple(da.sizes[r] for r in rest)
         return np.ascontiguousarray(arr).reshape(self.nx, self.ny, *rest_shape)
@@ -246,6 +255,7 @@ class CloudOpticsGT4Py:
         spec_dim, noncore = self._spec_dim(base, "tau")
         self._spec_dim = spec_dim
         self._noncore = noncore
+        self._noncore_sizes = {d: int(base.sizes[d]) for d in noncore}
         ncol = int(np.prod([base.sizes[d] for d in noncore]))
         assert ncol == self.nx * self.ny, (ncol, self.nx, self.ny)
 
