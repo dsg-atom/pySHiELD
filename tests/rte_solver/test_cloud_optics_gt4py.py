@@ -37,6 +37,10 @@ import pytest
 
 from ndsl.config import backend_python
 
+# GPU runs: set RTE_TEST_BACKEND=dace:gpu (or gt:gpu) on an A100 node to compile the
+# stencils for the GPU; unset = the default CPU backend used for correctness.
+backend_python = os.environ.get("RTE_TEST_BACKEND") or backend_python
+
 from pyshield.radiation.cloud_optics_gt4py import CloudOpticsGT4Py
 
 SITES = [0, 25, 50, 75]
