@@ -222,7 +222,7 @@ class CloudOpticsGT4Py:
         fint = val - idx0
         return idx0.astype(np.int64), fint
 
-    def _spec_dim(self, ds, var="tau"):
+    def _spectral_dim(self, ds, var="tau"):
         """Spectral dim of an optical-props var (the by-band 'gpt'/'bnd')."""
         layer = ds.mapping.get_dim("layer")
         noncore = [d for d in ds[var].dims if d != layer]
@@ -255,7 +255,7 @@ class CloudOpticsGT4Py:
 
         layer_dim = base.mapping.get_dim("layer")
         self._layer_dim = layer_dim
-        spec_dim, noncore = self._spec_dim(base, "tau")
+        spec_dim, noncore = self._spectral_dim(base, "tau")
         self._spec_dim = spec_dim
         self._noncore = noncore
         self._noncore_sizes = {d: int(base.sizes[d]) for d in noncore}
