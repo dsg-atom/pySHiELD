@@ -38,11 +38,11 @@ import os
 import numpy as np
 import pytest
 
-from ndsl.config import backend_python
+from ndsl.config import backend_python, backend_gpu
 
 # GPU runs: set RTE_TEST_BACKEND=dace:gpu (or gt:gpu) on an A100 node to compile the
 # stencils for the GPU; unset = the default CPU backend used for correctness.
-backend_python = os.environ.get("RTE_TEST_BACKEND") or backend_python
+backend_python = backend_gpu if os.environ.get("RTE_TEST_BACKEND") else backend_python
 
 from pyshield.radiation.sw_solver_gt4py import SWTwoStreamSolverGT4Py
 
