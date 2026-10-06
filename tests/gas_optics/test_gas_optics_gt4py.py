@@ -28,6 +28,11 @@ import pytest
 
 from ndsl.config import backend_python
 
+# GPU runs: set RTE_TEST_BACKEND=gt:gpu (or dace:gpu) on an A100 node;
+# unset = the default CPU backend used for correctness.
+import os  # noqa: E402
+backend_python = os.environ.get("RTE_TEST_BACKEND") or backend_python
+
 from pyshield.radiation.gas_optics_gt4py import GasOpticsGT4Py
 
 SITES = [0, 25, 50, 75]

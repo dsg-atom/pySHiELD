@@ -22,6 +22,11 @@ import xarray as xr
 
 from ndsl.boilerplate import get_factories_single_tile
 from ndsl.config import backend_python
+
+# GPU runs: set RTE_TEST_BACKEND=gt:gpu (or dace:gpu) on an A100 node;
+# unset = the default CPU backend used for correctness.
+import os  # noqa: E402
+backend_python = os.environ.get("RTE_TEST_BACKEND") or backend_python
 from ndsl.constants import I_DIM, J_DIM, K_DIM
 from ndsl.dsl.typing import Float
 
