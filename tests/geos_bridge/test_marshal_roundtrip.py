@@ -131,10 +131,22 @@ def test_halo_untouched(states):
     marshal.marshal_field_in(
         state.prsl, marshal._dims_of(state, "prsl"), arr, NX, NY, NZ, top_at_1=False
     )
-    full = np.asarray(state.prsl.field)
-    # Horizontal halo ring (first/last nhalo rows+cols) must still be zero.
+    # The halo must be checked on the FULL data buffer -- the same array
+    # to_rterrtmgp_xr reads via ``getattr(self, name)[:]`` before taking its
+    # ``[3:-4]`` interior slice. ``Quantity.field`` (and ``.view[:]``) is the
+    # halo-STRIPPED compute interior -- the (nx, ny[, nz]) region GFS physics
+    # receives -- so ``.field[:NHALO]`` would index the first NHALO *interior*
+    # cells (which marshal correctly fills), not the halo. Use ``[:]`` (==.data,
+    # the full halo'd buffer) exactly as to_rterrtmgp_xr does. marshal writes
+    # only quantity.view[:] = data[origin:origin+extent], so the halo ring
+    # (indices [:NHALO] low and [NHALO+extent:] high per axis) stays zero.
+    full = np.asarray(state.prsl[:])
+    # Low halo ring (first nhalo rows/cols) must still be zero.
     assert np.all(full[:NHALO, :, :] == 0.0)
     assert np.all(full[:, :NHALO, :] == 0.0)
+    # High halo ring (everything past the compute interior) must still be zero.
+    assert np.all(full[NHALO + NX :, :, :] == 0.0)
+    assert np.all(full[:, NHALO + NY :, :] == 0.0)
 
 
 def test_bad_shape_raises(states):
