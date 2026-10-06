@@ -32,6 +32,24 @@ from ndsl.dsl.typing import Float
 
 from pyshield.radiation.gas_optics import interp_tp
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs must be moved onto the device before `view[:] = ...`, and outputs moved
+# back to host before comparing with numpy. These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 
 def _lw_coeff_file():
     cache = os.environ.get("XDG_CACHE_HOME")
@@ -119,8 +137,8 @@ def test_interp_tp():
     jtemp_q, ftemp_q, jpress_q, fpress_q, tropo_q = (field() for _ in range(5))
 
     play, tlay = _synthetic_profiles(nx, ny, nz, c)
-    play_q.view[:] = play
-    tlay_q.view[:] = tlay
+    play_q.view[:] = _to_dev(play)
+    tlay_q.view[:] = _to_dev(tlay)
 
     stencil(
         play=play_q,
@@ -135,12 +153,12 @@ def test_interp_tp():
     jt, ftemp, jp, fpress, tropo = _numpy_oracle(play, tlay, c)
 
     # indices are integer-valued: require exact agreement
-    np.testing.assert_array_equal(jtemp_q.view[:], jt)
-    np.testing.assert_array_equal(jpress_q.view[:], jp)
+    np.testing.assert_array_equal(_to_host(jtemp_q.view[:]), jt)
+    np.testing.assert_array_equal(_to_host(jpress_q.view[:]), jp)
     # fractions and flag
-    np.testing.assert_allclose(ftemp_q.view[:], ftemp, rtol=0, atol=1e-12)
-    np.testing.assert_allclose(fpress_q.view[:], fpress, rtol=0, atol=1e-12)
-    np.testing.assert_array_equal(tropo_q.view[:], tropo)
+    np.testing.assert_allclose(_to_host(ftemp_q.view[:]), ftemp, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(_to_host(fpress_q.view[:]), fpress, rtol=0, atol=1e-12)
+    np.testing.assert_array_equal(_to_host(tropo_q.view[:]), tropo)
 
     # sanity: the profiles actually exercise more than one bin and both atmospheres
     assert np.unique(jt).size > 1
