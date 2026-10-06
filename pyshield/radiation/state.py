@@ -359,13 +359,13 @@ class RTE_RRTMGPState:
                         nz = self._nz
                         for dim_name in field_info.metadata["dims"]:
                             # dims.append(f"{dim_name}_{name}")
-                            if dim_name == "z_interface":
+                            if dim_name == K_INTERFACE_DIM:
                                 slice_list.append(
                                     np.s_[:]  # type: ignore[attr-defined]
                                 )
                                 nz = self._nz + 1
                                 dims.append("level")
-                            elif dim_name == "z":
+                            elif dim_name == K_DIM:
                                 slice_list.append(
                                     np.s_[:-1]  # type: ignore[attr-defined]
                                 )
