@@ -396,6 +396,7 @@ class RTE_RRTMGPDriver:
             "h2o": "qvapor",
             "o3": "qo3mr",
             "co": "co",
+            "ch4": "ch4",
             "n2o": "n2o",
             "o2": "o2",
             "co2": "co2",
