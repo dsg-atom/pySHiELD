@@ -51,6 +51,25 @@ from pyshield.radiation.gas_optics import (
     interp3d_major_gpt,
 )
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs (including raw-ndarray table args and host scalings that enter device
+# math) must be moved onto the device, and outputs moved back to host before
+# comparing with numpy. These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 SITES = [0, 25, 50, 75]
 EXPTS = [0, 6, 12, 17]
 
@@ -219,26 +238,29 @@ def test_tau_full():
         "f112": (0, 0, 1), "f212": (1, 0, 1), "f122": (0, 1, 1), "f222": (1, 1, 1),
     }
 
-    jtemp_q.view[:] = jtemp0
+    # move the major coefficient table onto the device once (no-op on CPU)
+    kmajor_d = _to_dev(kmajor)
+
+    jtemp_q.view[:] = _to_dev(jtemp0)
 
     # --- major assembly (validated in test_tau_major) ------------------------
     tau_major_q = tauq()
-    jpress_q.view[:] = jpress0
+    jpress_q.view[:] = _to_dev(jpress0)
     for g in range(ngpt):
         iflav = (gpoint_flavor[g, itropo] - 1).astype(np.int64)
-        s1_q.view[:] = col_mix[0][si, ei, li, iflav]
-        s2_q.view[:] = col_mix[1][si, ei, li, iflav]
+        s1_q.view[:] = _to_dev(col_mix[0][si, ei, li, iflav])
+        s2_q.view[:] = _to_dev(col_mix[1][si, ei, li, iflav])
         for name, (e, p, t) in fmaj_axes.items():
-            fmaj_q[name].view[:] = fmajor[e, p, t][si, ei, li, iflav]
-        jeta1_q.view[:] = (jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64)
-        jeta2_q.view[:] = (jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64)
+            fmaj_q[name].view[:] = _to_dev(fmajor[e, p, t][si, ei, li, iflav])
+        jeta1_q.view[:] = _to_dev((jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64))
+        jeta2_q.view[:] = _to_dev((jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64))
         igpt_q.view[:] = g
         major(
             scaling1=s1_q, scaling2=s2_q,
             f111=fmaj_q["f111"], f211=fmaj_q["f211"], f121=fmaj_q["f121"], f221=fmaj_q["f221"],
             f112=fmaj_q["f112"], f212=fmaj_q["f212"], f122=fmaj_q["f122"], f222=fmaj_q["f222"],
             jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q, igpt=igpt_q,
-            kmajor=kmajor, res=res_q,
+            kmajor=kmajor_d, res=res_q,
         )
         tau_major_q.view[:, :, :, g] = res_q.view[:]
 
@@ -261,6 +283,7 @@ def test_tau_full():
         assert nk <= NMINORK, (nk, NMINORK)
         kmin_pad = np.zeros((14, 9, NMINORK), dtype=kmin.dtype)
         kmin_pad[:, :, :nk] = kmin
+        kmin_pad_d = _to_dev(kmin_pad)  # device copy of the minor table (no-op on CPU)
 
         names = go.extract_names(ds[f"minor_gases_{suffix}"].data)
         scal_names = go.extract_names(ds[f"scaling_gas_{suffix}"].data)
@@ -292,28 +315,31 @@ def test_tau_full():
                     scaling = scaling * ((1.0 - fac) if scomp[imnr] else fac)
             scaling = np.where(layer_mask, scaling, 0.0)
 
-            fmn_q["fmn11"].view[:] = fminor[0, 0][si, ei, li, iflav]
-            fmn_q["fmn21"].view[:] = fminor[1, 0][si, ei, li, iflav]
-            fmn_q["fmn12"].view[:] = fminor[0, 1][si, ei, li, iflav]
-            fmn_q["fmn22"].view[:] = fminor[1, 1][si, ei, li, iflav]
-            jeta1_q.view[:] = (jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64)
-            jeta2_q.view[:] = (jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64)
+            fmn_q["fmn11"].view[:] = _to_dev(fminor[0, 0][si, ei, li, iflav])
+            fmn_q["fmn21"].view[:] = _to_dev(fminor[1, 0][si, ei, li, iflav])
+            fmn_q["fmn12"].view[:] = _to_dev(fminor[0, 1][si, ei, li, iflav])
+            fmn_q["fmn22"].view[:] = _to_dev(fminor[1, 1][si, ei, li, iflav])
+            jeta1_q.view[:] = _to_dev((jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64))
+            jeta2_q.view[:] = _to_dev((jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64))
 
+            scaling_d = _to_dev(scaling)  # host scaling -> device for the device multiply
             for g in range(gptS0, gptE0 + 1):
                 kg_q.view[:] = ks0 + (g - gptS0)
                 minor(
                     fmn11=fmn_q["fmn11"], fmn21=fmn_q["fmn21"],
                     fmn12=fmn_q["fmn12"], fmn22=fmn_q["fmn22"],
                     jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
-                    kminor=kmin_pad, res=res_q,
+                    kminor=kmin_pad_d, res=res_q,
                 )
-                tau_minor_q.view[:, :, :, g] += scaling * res_q.view[:]
+                tau_minor_q.view[:, :, :, g] += scaling_d * res_q.view[:]
 
     run_minor("lower", 0, tropo)
     run_minor("upper", 1, ~tropo)
 
-    tau_full_mine = tau_major_q.view[:] + tau_minor_q.view[:]
+    tau_major = _to_host(tau_major_q.view[:])
+    tau_minor = _to_host(tau_minor_q.view[:])
+    tau_full_mine = tau_major + tau_minor
 
-    np.testing.assert_allclose(tau_major_q.view[:], tau_major_ref, rtol=1e-10, atol=1e-22)
-    np.testing.assert_allclose(tau_minor_q.view[:], tau_minor_ref, rtol=1e-9, atol=1e-22)
+    np.testing.assert_allclose(tau_major, tau_major_ref, rtol=1e-10, atol=1e-22)
+    np.testing.assert_allclose(tau_minor, tau_minor_ref, rtol=1e-9, atol=1e-22)
     np.testing.assert_allclose(tau_full_mine, tau_full_ref, rtol=1e-9, atol=1e-22)

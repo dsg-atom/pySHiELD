@@ -31,6 +31,24 @@ from ndsl.dsl.typing import Float
 
 from pyshield.radiation.gas_optics import interp_weights
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs must be moved onto the device before `view[:] = ...`, and outputs moved
+# back to host before comparing with numpy. These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 
 def test_interp_weights():
     nx, ny, nz, nhalo = 4, 4, 8, 3
@@ -75,10 +93,10 @@ def test_interp_weights():
     fmn_q = {name: ff() for name in o_fmn}
     fmaj_q = {name: ff() for name in o_fmaj}
 
-    ftemp_q.view[:] = ftemp
-    fpress_q.view[:] = fpress
-    feta1_q.view[:] = feta1
-    feta2_q.view[:] = feta2
+    ftemp_q.view[:] = _to_dev(ftemp)
+    fpress_q.view[:] = _to_dev(fpress)
+    feta1_q.view[:] = _to_dev(feta1)
+    feta2_q.view[:] = _to_dev(feta2)
 
     stencil(
         ftemp=ftemp_q,
@@ -101,12 +119,12 @@ def test_interp_weights():
 
     # compare ----------------------------------------------------------------
     for name, o in o_fmn.items():
-        np.testing.assert_allclose(fmn_q[name].view[:], o, rtol=0, atol=1e-15, err_msg=name)
+        np.testing.assert_allclose(_to_host(fmn_q[name].view[:]), o, rtol=0, atol=1e-15, err_msg=name)
     for name, o in o_fmaj.items():
-        np.testing.assert_allclose(fmaj_q[name].view[:], o, rtol=0, atol=1e-15, err_msg=name)
+        np.testing.assert_allclose(_to_host(fmaj_q[name].view[:]), o, rtol=0, atol=1e-15, err_msg=name)
 
     # partition of unity: the eight fmajor and the four fminor each sum to 1
-    fmaj_sum = sum(fmaj_q[name].view[:] for name in o_fmaj)
-    fmn_sum = sum(fmn_q[name].view[:] for name in o_fmn)
+    fmaj_sum = sum(_to_host(fmaj_q[name].view[:]) for name in o_fmaj)
+    fmn_sum = sum(_to_host(fmn_q[name].view[:]) for name in o_fmn)
     np.testing.assert_allclose(fmaj_sum, 1.0, rtol=0, atol=1e-13)
     np.testing.assert_allclose(fmn_sum, 1.0, rtol=0, atol=1e-13)

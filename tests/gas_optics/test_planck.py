@@ -71,6 +71,25 @@ from pyshield.radiation.gas_optics import (
     planck_interp1d,
 )
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs (including raw-ndarray table args passed to the stencil) must be moved
+# onto the device, and stencil outputs moved back to host before they land in the
+# host numpy source arrays / comparisons. These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 SITES = [0, 25, 50, 75]
 EXPTS = [0, 6, 12, 17]
 
@@ -235,8 +254,12 @@ def test_planck():
     fmaj_q = {n: ff() for n in ("f111", "f211", "f121", "f221", "f112", "f212", "f122", "f222")}
     jtemp_q, jpress_q, jeta1_q, jeta2_q, igpt_q = fi(), fi(), fi(), fi(), fi()
     res_q = ff()
-    jtemp_q.view[:] = jtemp0
-    jpress_q.view[:] = jpress0
+    jtemp_q.view[:] = _to_dev(jtemp0)
+    jpress_q.view[:] = _to_dev(jpress0)
+
+    # move the coefficient tables onto the device once (no-ops on CPU)
+    pfracin_d = _to_dev(pfracin)
+    totplnk_d = _to_dev(totplnk)
 
     fmaj_axes = {
         "f111": (0, 0, 0), "f211": (1, 0, 0), "f121": (0, 1, 0), "f221": (1, 1, 0),
@@ -248,18 +271,18 @@ def test_planck():
     for g in range(ngpt):
         iflav = (gpoint_flavor[g, itropo] - 1).astype(np.int64)
         for name, (e, p, t) in fmaj_axes.items():
-            fmaj_q[name].view[:] = fmajor[e, p, t][si, ei, li, iflav]
-        jeta1_q.view[:] = (jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64)
-        jeta2_q.view[:] = (jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64)
+            fmaj_q[name].view[:] = _to_dev(fmajor[e, p, t][si, ei, li, iflav])
+        jeta1_q.view[:] = _to_dev((jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64))
+        jeta2_q.view[:] = _to_dev((jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64))
         igpt_q.view[:] = g
         major(
             scaling1=s1_q, scaling2=s2_q,
             f111=fmaj_q["f111"], f211=fmaj_q["f211"], f121=fmaj_q["f121"], f221=fmaj_q["f221"],
             f112=fmaj_q["f112"], f212=fmaj_q["f212"], f122=fmaj_q["f122"], f222=fmaj_q["f222"],
             jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q, igpt=igpt_q,
-            kmajor=pfracin, res=res_q,
+            kmajor=pfracin_d, res=res_q,
         )
-        pfrac[:, :, :, g] = res_q.view[:]
+        pfrac[:, :, :, g] = _to_host(res_q.view[:])
 
     # ------------------------------------------------------------------------
     # planck values via the totplnk 1-D interp (host idx/frac, stencil gather)
@@ -278,12 +301,12 @@ def test_planck():
     frac_sfcd_q, idx_sfcd_q = ff(), fi()
     iband_q = fi()
     planck_lay_q, planck_sfc_q, planck_sfcd_q = ff(), ff(), ff()
-    frac_lay_q.view[:] = frac_lay
-    idx_lay_q.view[:] = idx_lay
-    frac_sfc_q.view[:] = frac_sfc
-    idx_sfc_q.view[:] = idx_sfc
-    frac_sfcd_q.view[:] = frac_sfcd
-    idx_sfcd_q.view[:] = idx_sfcd
+    frac_lay_q.view[:] = _to_dev(frac_lay)
+    idx_lay_q.view[:] = _to_dev(idx_lay)
+    frac_sfc_q.view[:] = _to_dev(frac_sfc)
+    idx_sfc_q.view[:] = _to_dev(idx_sfc)
+    frac_sfcd_q.view[:] = _to_dev(frac_sfcd)
+    idx_sfcd_q.view[:] = _to_dev(idx_sfcd)
 
     # level-sized planck uses a second (nx,ny,nz+1) factory
     sf_lev, qf_lev = get_factories_single_tile(
@@ -298,8 +321,8 @@ def test_planck():
     iband_lev_q = qf_lev.zeros([I_DIM, J_DIM, K_DIM], "", dtype=Int)
     planck_lev_q = qf_lev.zeros([I_DIM, J_DIM, K_DIM], "", dtype=Float)
     idx_lev, frac_lev = _idx_frac(tlev, temp_ref_min, totplnk_delta, nplancktemp)
-    frac_lev_q.view[:] = frac_lev
-    idx_lev_q.view[:] = idx_lev
+    frac_lev_q.view[:] = _to_dev(frac_lev)
+    idx_lev_q.view[:] = _to_dev(idx_lev)
 
     # ------------------------------------------------------------------------
     # assembly, per band then per g-point in the band
@@ -315,15 +338,15 @@ def test_planck():
 
         iband_q.view[:] = ibnd
         iband_lev_q.view[:] = ibnd
-        planck_lay_sten(frac=frac_lay_q, idx=idx_lay_q, iband=iband_q, totplnk=totplnk, planck=planck_lay_q)
-        planck_lay_sten(frac=frac_sfc_q, idx=idx_sfc_q, iband=iband_q, totplnk=totplnk, planck=planck_sfc_q)
-        planck_lay_sten(frac=frac_sfcd_q, idx=idx_sfcd_q, iband=iband_q, totplnk=totplnk, planck=planck_sfcd_q)
-        planck_lev_sten(frac=frac_lev_q, idx=idx_lev_q, iband=iband_lev_q, totplnk=totplnk, planck=planck_lev_q)
+        planck_lay_sten(frac=frac_lay_q, idx=idx_lay_q, iband=iband_q, totplnk=totplnk_d, planck=planck_lay_q)
+        planck_lay_sten(frac=frac_sfc_q, idx=idx_sfc_q, iband=iband_q, totplnk=totplnk_d, planck=planck_sfc_q)
+        planck_lay_sten(frac=frac_sfcd_q, idx=idx_sfcd_q, iband=iband_q, totplnk=totplnk_d, planck=planck_sfcd_q)
+        planck_lev_sten(frac=frac_lev_q, idx=idx_lev_q, iband=iband_lev_q, totplnk=totplnk_d, planck=planck_lev_q)
 
-        pl_lay = planck_lay_q.view[:]  # (nx,ny,nz)
-        pl_sfc = planck_sfc_q.view[:, :, 0]  # (nx,ny)
-        pl_sfcd = planck_sfcd_q.view[:, :, 0]  # (nx,ny)
-        pl_lev = planck_lev_q.view[:]  # (nx,ny,nz+1)
+        pl_lay = _to_host(planck_lay_q.view[:])  # (nx,ny,nz)
+        pl_sfc = _to_host(planck_sfc_q.view[:, :, 0])  # (nx,ny)
+        pl_sfcd = _to_host(planck_sfcd_q.view[:, :, 0])  # (nx,ny)
+        pl_lev = _to_host(planck_lev_q.view[:])  # (nx,ny,nz+1)
 
         for g in range(gptS0, gptE0 + 1):
             pf = pfrac[:, :, :, g]  # (nx,ny,nz)

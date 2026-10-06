@@ -60,6 +60,25 @@ from pyshield.radiation.gas_optics import (
     interp2d_rayl_gpt,
 )
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs (including raw-ndarray table args passed to the stencil) must be moved
+# onto the device, and stencil outputs moved back to host before they combine with
+# host numpy arrays / comparisons. These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 SITES = [0, 25, 50, 75]
 EXPTS = [0, 6, 12, 17]
 
@@ -177,7 +196,10 @@ def test_sw_gas_optics():
     fmn_q = {n: ff() for n in ("fmn11", "fmn21", "fmn12", "fmn22")}
     jtemp_q, jeta1_q, jeta2_q, kg_q = fi(), fi(), fi(), fi()
     res_q = ff()
-    jtemp_q.view[:] = jtemp0
+    jtemp_q.view[:] = _to_dev(jtemp0)
+
+    # move the Rayleigh coefficient tables onto the device once (no-op on CPU)
+    krayl_d = {b: _to_dev(krayl[b]) for b in ("lower", "upper")}
 
     si, ei, li = np.indices((nx, ny, nz))
 
@@ -187,20 +209,20 @@ def test_sw_gas_optics():
         k_half = {}
         for b, bi in (("lower", 0), ("upper", 1)):
             iflav = (gpoint_flavor[g, bi] - 1).astype(np.int64)
-            fmn_q["fmn11"].view[:] = fminor[0, 0][si, ei, li, iflav]
-            fmn_q["fmn21"].view[:] = fminor[1, 0][si, ei, li, iflav]
-            fmn_q["fmn12"].view[:] = fminor[0, 1][si, ei, li, iflav]
-            fmn_q["fmn22"].view[:] = fminor[1, 1][si, ei, li, iflav]
-            jeta1_q.view[:] = (jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64)
-            jeta2_q.view[:] = (jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64)
+            fmn_q["fmn11"].view[:] = _to_dev(fminor[0, 0][si, ei, li, iflav])
+            fmn_q["fmn21"].view[:] = _to_dev(fminor[1, 0][si, ei, li, iflav])
+            fmn_q["fmn12"].view[:] = _to_dev(fminor[0, 1][si, ei, li, iflav])
+            fmn_q["fmn22"].view[:] = _to_dev(fminor[1, 1][si, ei, li, iflav])
+            jeta1_q.view[:] = _to_dev((jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64))
+            jeta2_q.view[:] = _to_dev((jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64))
             kg_q.view[:] = g
             rayl(
                 fmn11=fmn_q["fmn11"], fmn21=fmn_q["fmn21"],
                 fmn12=fmn_q["fmn12"], fmn22=fmn_q["fmn22"],
                 jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
-                krayl=krayl[b], res=res_q,
+                krayl=krayl_d[b], res=res_q,
             )
-            k_half[b] = res_q.view[:].copy()
+            k_half[b] = _to_host(res_q.view[:]).copy()
         k = np.where(tropo, k_half["lower"], k_half["upper"])
         tau_rayl_mine[:, :, :, g] = k * (col_h2o + col_dry)
 

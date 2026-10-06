@@ -36,6 +36,24 @@ from ndsl.dsl.typing import Float, Int
 
 from pyshield.radiation.gas_optics import interp_eta_1flavor
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs must be moved onto the device before `view[:] = ...`, and outputs moved
+# back to host before comparing with numpy. These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 
 def _lw_coeff_file():
     cache = os.environ.get("XDG_CACHE_HOME")
@@ -134,11 +152,11 @@ def test_interp_eta_1flavor():
     col_mix0_q, col_mix1_q = ff(), ff()
     jeta0_q, jeta1_q, feta0_q, feta1_q = ff(), ff(), ff(), ff()
 
-    col_gas1_q.view[:] = col_gas1
-    col_gas2_q.view[:] = col_gas2
-    itropo_q.view[:] = itropo
-    jt0_q.view[:] = jt0
-    jt1_q.view[:] = jt1
+    col_gas1_q.view[:] = _to_dev(col_gas1)
+    col_gas2_q.view[:] = _to_dev(col_gas2)
+    itropo_q.view[:] = _to_dev(itropo)
+    jt0_q.view[:] = _to_dev(jt0)
+    jt1_q.view[:] = _to_dev(jt1)
 
     stencil(
         col_gas1=col_gas1_q,
@@ -146,7 +164,7 @@ def test_interp_eta_1flavor():
         itropo=itropo_q,
         jt0=jt0_q,
         jt1=jt1_q,
-        vmr_ref=vmr,
+        vmr_ref=_to_dev(vmr),
         col_mix0=col_mix0_q,
         col_mix1=col_mix1_q,
         jeta0=jeta0_q,
@@ -156,12 +174,12 @@ def test_interp_eta_1flavor():
     )
 
     # compare ----------------------------------------------------------------
-    np.testing.assert_allclose(col_mix0_q.view[:], o_col_mix0, rtol=1e-12, atol=1e-12)
-    np.testing.assert_allclose(col_mix1_q.view[:], o_col_mix1, rtol=1e-12, atol=1e-12)
-    np.testing.assert_array_equal(jeta0_q.view[:], o_jeta0)
-    np.testing.assert_array_equal(jeta1_q.view[:], o_jeta1)
-    np.testing.assert_allclose(feta0_q.view[:], o_feta0, rtol=0, atol=1e-12)
-    np.testing.assert_allclose(feta1_q.view[:], o_feta1, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(_to_host(col_mix0_q.view[:]), o_col_mix0, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(_to_host(col_mix1_q.view[:]), o_col_mix1, rtol=1e-12, atol=1e-12)
+    np.testing.assert_array_equal(_to_host(jeta0_q.view[:]), o_jeta0)
+    np.testing.assert_array_equal(_to_host(jeta1_q.view[:]), o_jeta1)
+    np.testing.assert_allclose(_to_host(feta0_q.view[:]), o_feta0, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(_to_host(feta1_q.view[:]), o_feta1, rtol=0, atol=1e-12)
 
     # sanity: the gather and both branches are actually exercised
     assert set(np.unique(itropo)) == {0, 1}

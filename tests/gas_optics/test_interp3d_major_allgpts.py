@@ -46,6 +46,25 @@ from ndsl.dsl.typing import Float, Int
 
 from pyshield.radiation.gas_optics import NGPT, interp3d_major_gpt
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs (including raw-ndarray table args passed to the stencil) must be moved
+# onto the device, and outputs moved back to host before comparing with numpy.
+# These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 
 def _lw_coeff_file():
     cache = os.environ.get("XDG_CACHE_HOME")
@@ -137,14 +156,17 @@ def test_interp3d_major_allgpts():
     tau_q = quantity_factory.zeros([I_DIM, J_DIM, K_DIM, "gpt"], "", dtype=Float)
     assert tau_q.view[:].shape == (nx, ny, nz, ngpt), tau_q.view[:].shape
 
-    scaling1_q.view[:] = scaling1
-    scaling2_q.view[:] = scaling2
+    scaling1_q.view[:] = _to_dev(scaling1)
+    scaling2_q.view[:] = _to_dev(scaling2)
     for name, arr in fw.items():
-        fw_q[name].view[:] = arr
-    jtemp_q.view[:] = jtemp
-    jpress_q.view[:] = jpress
-    jeta1_q.view[:] = jeta1
-    jeta2_q.view[:] = jeta2
+        fw_q[name].view[:] = _to_dev(arr)
+    jtemp_q.view[:] = _to_dev(jtemp)
+    jpress_q.view[:] = _to_dev(jpress)
+    jeta1_q.view[:] = _to_dev(jeta1)
+    jeta2_q.view[:] = _to_dev(jeta2)
+
+    # move the coefficient table onto the device once (no-op on CPU)
+    kmajor_d = _to_dev(kmajor)
 
     # drive the single compiled stencil once per g-point, assembling tau
     for g in range(ngpt):
@@ -165,14 +187,15 @@ def test_interp3d_major_allgpts():
             jeta1=jeta1_q,
             jeta2=jeta2_q,
             igpt=igpt_q,
-            kmajor=kmajor,
+            kmajor=kmajor_d,
             res=res_q,
         )
         tau_q.view[:, :, :, g] = res_q.view[:]
 
-    np.testing.assert_allclose(tau_q.view[:], o_tau, rtol=1e-12, atol=0.0)
+    tau = _to_host(tau_q.view[:])
+    np.testing.assert_allclose(tau, o_tau, rtol=1e-12, atol=0.0)
 
     # sanity: the g-point axis is genuinely populated and varies
-    assert np.all(np.isfinite(tau_q.view[:]))
-    assert np.any(tau_q.view[:] != 0.0)
-    assert np.unique(tau_q.view[0, 0, 0, :]).size > 1  # g-points differ
+    assert np.all(np.isfinite(tau))
+    assert np.any(tau != 0.0)
+    assert np.unique(tau[0, 0, 0, :]).size > 1  # g-points differ

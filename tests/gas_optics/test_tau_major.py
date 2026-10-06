@@ -45,6 +45,25 @@ from ndsl.dsl.typing import Float, Int
 
 from pyshield.radiation.gas_optics import NGPT, interp3d_major_gpt
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs (including raw-ndarray table args passed to the stencil) must be moved
+# onto the device, and outputs moved back to host before comparing with numpy.
+# These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 # A representative column subset: correctness is per-cell independent, so a few
 # columns keep the 256 stencil launches fast while all 60 layers exercise both
 # troposphere states and the g-point loop exercises all 10 flavors.
@@ -169,9 +188,12 @@ def test_tau_major():
     res_q = ff()
     tau_q = quantity_factory.zeros([I_DIM, J_DIM, K_DIM, "gpt"], "", dtype=Float)
 
+    # move the coefficient table onto the device once (no-op on CPU)
+    kmajor_d = _to_dev(kmajor)
+
     # flavor-independent indices are set once
-    jtemp_q.view[:] = jtemp0
-    jpress_q.view[:] = jpress0
+    jtemp_q.view[:] = _to_dev(jtemp0)
+    jpress_q.view[:] = _to_dev(jpress0)
 
     # fmajor axes (eta, press, temp) -> f<e><p><t>
     fmaj_axes = {
@@ -185,12 +207,12 @@ def test_tau_major():
         # per-cell flavor for this g-point, selected by troposphere state
         iflav = (gpoint_flavor[g, itropo] - 1).astype(np.int64)  # (nx, ny, nz), 0-based
 
-        s1_q.view[:] = col_mix[0][si, ei, li, iflav]
-        s2_q.view[:] = col_mix[1][si, ei, li, iflav]
+        s1_q.view[:] = _to_dev(col_mix[0][si, ei, li, iflav])
+        s2_q.view[:] = _to_dev(col_mix[1][si, ei, li, iflav])
         for name, (e, p, t) in fmaj_axes.items():
-            fmaj_q[name].view[:] = fmajor[e, p, t][si, ei, li, iflav]
-        jeta1_q.view[:] = (jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64)
-        jeta2_q.view[:] = (jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64)
+            fmaj_q[name].view[:] = _to_dev(fmajor[e, p, t][si, ei, li, iflav])
+        jeta1_q.view[:] = _to_dev((jeta_f[0][si, ei, li, iflav] - 1).astype(np.int64))
+        jeta2_q.view[:] = _to_dev((jeta_f[1][si, ei, li, iflav] - 1).astype(np.int64))
         igpt_q.view[:] = g
 
         stencil(
@@ -209,14 +231,15 @@ def test_tau_major():
             jeta1=jeta1_q,
             jeta2=jeta2_q,
             igpt=igpt_q,
-            kmajor=kmajor,
+            kmajor=kmajor_d,
             res=res_q,
         )
         tau_q.view[:, :, :, g] = res_q.view[:]
 
     # compare to pyRTE's major-only tau ---------------------------------------
-    np.testing.assert_allclose(tau_q.view[:], tau_ref, rtol=1e-10, atol=1e-22)
+    tau = _to_host(tau_q.view[:])
+    np.testing.assert_allclose(tau, tau_ref, rtol=1e-10, atol=1e-22)
 
     # sanity: real absorption was gathered and varies across g-points
-    assert np.all(np.isfinite(tau_q.view[:]))
-    assert np.any(tau_q.view[:] > 0.0)
+    assert np.all(np.isfinite(tau))
+    assert np.any(tau > 0.0)

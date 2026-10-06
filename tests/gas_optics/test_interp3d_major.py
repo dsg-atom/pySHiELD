@@ -34,6 +34,25 @@ from ndsl.dsl.typing import Float, Int
 
 from pyshield.radiation.gas_optics import interp3d_major_1gpt
 
+# On the GPU backend the Quantity storage is a cupy (device) array, so host numpy
+# inputs (including raw-ndarray table args passed to the stencil) must be moved
+# onto the device, and outputs moved back to host before comparing with numpy.
+# These are no-ops on the CPU backend.
+if backend_python is backend_gpu:
+    import cupy as _cp
+
+    def _to_dev(a):
+        return _cp.asarray(a)
+
+    def _to_host(a):
+        return _cp.asnumpy(a)
+else:
+    def _to_dev(a):
+        return a
+
+    def _to_host(a):
+        return np.asarray(a)
+
 IGPT = 100  # fixed g-point to evaluate (into kmajor axis 3, size 256)
 
 
@@ -122,14 +141,14 @@ def test_interp3d_major_1gpt():
     jtemp_q, jpress_q, jeta1_q, jeta2_q = fi(), fi(), fi(), fi()
     res_q = ff()
 
-    scaling1_q.view[:] = scaling1
-    scaling2_q.view[:] = scaling2
+    scaling1_q.view[:] = _to_dev(scaling1)
+    scaling2_q.view[:] = _to_dev(scaling2)
     for name, arr in fw.items():
-        fw_q[name].view[:] = arr
-    jtemp_q.view[:] = jtemp
-    jpress_q.view[:] = jpress
-    jeta1_q.view[:] = jeta1
-    jeta2_q.view[:] = jeta2
+        fw_q[name].view[:] = _to_dev(arr)
+    jtemp_q.view[:] = _to_dev(jtemp)
+    jpress_q.view[:] = _to_dev(jpress)
+    jeta1_q.view[:] = _to_dev(jeta1)
+    jeta2_q.view[:] = _to_dev(jeta2)
 
     stencil(
         scaling1=scaling1_q,
@@ -146,13 +165,14 @@ def test_interp3d_major_1gpt():
         jpress=jpress_q,
         jeta1=jeta1_q,
         jeta2=jeta2_q,
-        kmajor=kmajor,
+        kmajor=_to_dev(kmajor),
         res=res_q,
     )
 
-    np.testing.assert_allclose(res_q.view[:], o_res, rtol=1e-12, atol=0.0)
+    res = _to_host(res_q.view[:])
+    np.testing.assert_allclose(res, o_res, rtol=1e-12, atol=0.0)
 
     # sanity: real table values were gathered and the result is nontrivial
-    assert np.all(np.isfinite(res_q.view[:]))
+    assert np.all(np.isfinite(res))
     assert np.unique(jpress).size > 1 and np.unique(jtemp).size > 1
-    assert np.any(res_q.view[:] != 0.0)
+    assert np.any(res != 0.0)
