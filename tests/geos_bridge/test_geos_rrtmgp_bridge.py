@@ -34,7 +34,8 @@ from ndsl.config import backend_python
 from ndsl.dsl.typing import Float
 
 
-NX, NY, NZ, NHALO = 2, 2, 24, 3
+# NDSL requires nx > nhalo (SubtileGridSizer), so the tile must exceed the halo.
+NX, NY, NZ, NHALO = 4, 4, 24, 3
 NCOL = NX * NY
 
 

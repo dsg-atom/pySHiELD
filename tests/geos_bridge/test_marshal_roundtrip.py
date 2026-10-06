@@ -28,7 +28,8 @@ from pyshield.radiation.state import RTE_RRTMGPState
 from pyshield.stencils.surface import SurfaceState
 
 
-NX, NY, NZ, NHALO = 3, 4, 10, 3
+# NDSL requires nx > nhalo (SubtileGridSizer), so the tile must exceed the halo.
+NX, NY, NZ, NHALO = 4, 4, 10, 3
 NCOL = NX * NY
 
 
