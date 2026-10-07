@@ -207,6 +207,17 @@ def geos_rrtmgp_init(
 
     if backend is None:
         backend = os.environ.get("GEOS_RRTMGP_BACKEND", "numpy")
+    if isinstance(backend, str):
+        # ndsl's get_factories_single_tile needs a Backend OBJECT, not a name
+        # string (same lesson as the rte_solver/gas_optics GPU tests). Map the
+        # env/string name to the ndsl.config object.
+        from ndsl.config import backend_gpu, backend_python
+
+        backend = (
+            backend_gpu
+            if backend.lower() in ("gpu", "gt:gpu", "dace:gpu")
+            else backend_python
+        )
 
     if sigma is None:
         if ak is None or bk is None:

@@ -18,9 +18,11 @@ void geos_rrtmgp_interface_c_init(
     int nx, int ny, int nz, int nhalo, int top_at_1,
     int yy, int mm, int dd, int hh, int mn, int sc, double dt)
 {
-    MPI_Comm comm_c = MPI_Comm_f2c(comm_f);
+    /* Radiation is column-independent and ignores the comm (the Python
+       trampoline drops it); pass the Fortran int handle straight through so the
+       C ABI is int->int. No MPI_Comm_f2c needed. */
     geos_rrtmgp_interface_py_init(
-        comm_c,
+        comm_f,
         nx, ny, nz, nhalo, top_at_1,
         yy, mm, dd, hh, mn, sc, dt);
 }
@@ -45,10 +47,9 @@ void geos_rrtmgp_interface_c(
     double *fswn,
     double *hrtlw, double *hrtsw, double *hrtlw_clr, double *hrtsw_clr)
 {
-    MPI_Comm comm_c = MPI_Comm_f2c(comm_f);
-
+    /* comm ignored by radiation; pass the Fortran int handle straight through. */
     geos_rrtmgp_interface_py(
-        comm_c,
+        comm_f,
         nx, ny, nz, top_at_1,
         yy, mm, dd, hh, mn, sc,
 
