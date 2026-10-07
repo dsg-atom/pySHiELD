@@ -17,6 +17,10 @@ set -euo pipefail
 
 # --- Fork-A re-entry block (discover-ndsl-env skill). Adjust USER / paths. ---
 module load python/GEOSpyD/24.11.3-0/3.12 comp/gcc/13.2.0
+# MPI compiler wrappers (mpicc/mpif90) for the shim+driver; matched to gcc 13.2.0.
+# (Radiation is column-independent and does not really need MPI; the MPI_Comm_f2c
+# path is inherited from the gtFV3 template.)
+module load mpi/openmpi/4.1.6/gcc-13.2.0
 export CC=gcc CXX=g++ FC=gfortran
 : "${FORK_A:=/discover/nobackup/${USER}/fork-a}"
 export XDG_CACHE_HOME="${FORK_A}/.cache"
