@@ -28,6 +28,11 @@ source "${FORK_A}/venv/bin/activate"
 
 # --- Bridge run configuration (geos_rrtmgp_env.py reads these) ---
 export GEOS_RRTMGP_BACKEND="${GEOS_RRTMGP_BACKEND:-numpy}"
+# This standalone driver fills its whole-tile buffers C-contiguous
+# (idx = (c-1)*nlev + l; see geos_rrtmgp_driver.f90), so the R8 layout adapter
+# must use C order. Real GEOS passes Fortran column-major arrays and uses the
+# default "F". RadiationR8Conversion reads this env var.
+export GEOS_RRTMGP_ARRAY_ORDER="${GEOS_RRTMGP_ARRAY_ORDER:-C}"
 # input_dir only needs to be a readable dir under the chosen flags (no text files
 # are read: isolar=10, iemsflg=0, ico2flg=0, ictmflg=-1, ioznflg=1, ialbflg=-1).
 export GEOS_RRTMGP_INPUT_DIR="${GEOS_RRTMGP_INPUT_DIR:-$(mktemp -d)}"
