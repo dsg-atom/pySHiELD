@@ -98,6 +98,16 @@ for _p in _rad_paths.split(":"):
         _sys.path.insert(0, _p)  # ahead of GEOSpyD base so the venv's numpy/ndsl win
     _site.addsitedir(_p)         # also process .pth (the editable pyshield pointer)
 
+# GEOS links its own HDF5 STATICALLY, so those symbols are global in the running
+# process and would override the venv netCDF4's bundled HDF5 (a different version)
+# -> "NetCDF: HDF error" when pyRTE reads the RRTMGP coefficient files. Load
+# subsequent C extensions (netCDF4 -> libnetcdf -> libhdf5) with RTLD_DEEPBIND so
+# each prefers its OWN dependency's symbols over the host's. Set before any import
+# that pulls in netCDF4 (pyRTE's xr.load_dataset at driver init). Can be disabled
+# with GEOS_RRTMGP_NO_DEEPBIND=1 if it ever interacts badly with another extension.
+if hasattr(_os, "RTLD_DEEPBIND") and _os.environ.get("GEOS_RRTMGP_NO_DEEPBIND") != "1":
+    _sys.setdlopenflags(_sys.getdlopenflags() | _os.RTLD_DEEPBIND)
+
 from __TMPFILEBASE__ import ffi
 from mpi4py import MPI
 
