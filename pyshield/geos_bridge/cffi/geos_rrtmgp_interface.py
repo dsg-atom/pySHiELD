@@ -92,8 +92,11 @@ _rad_paths = (
 )
 for _p in _rad_paths.split(":"):
     _p = _p.strip()
-    if _p and _p not in _sys.path:
-        _site.addsitedir(_p)
+    if not _p:
+        continue
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)  # ahead of GEOSpyD base so the venv's numpy/ndsl win
+    _site.addsitedir(_p)         # also process .pth (the editable pyshield pointer)
 
 from __TMPFILEBASE__ import ffi
 from mpi4py import MPI
