@@ -74,6 +74,27 @@ extern void geos_rrtmgp_interface_py_finalize();
 source = r'''
 import datetime
 
+# Make the Fork-A venv importable to this EMBEDDED interpreter. The .so embeds
+# GEOSpyD's base libpython, whose default sys.path has mpi4py/numpy but NOT the
+# venv's pyshield/ndsl/pyRTE. pyshield is an editable install, so its location
+# lives in a .pth file that only site processing reads -- a bare sys.path entry
+# is not enough. Read a colon-separated list from GEOS_RRTMGP_PYTHONPATH (then
+# PYTHONPATH) and site.addsitedir each entry so .pth files are processed too.
+# This does not depend on the embedded Py_Initialize honoring PYTHONPATH.
+import os as _os
+import site as _site
+import sys as _sys
+
+_rad_paths = (
+    _os.environ.get("GEOS_RRTMGP_PYTHONPATH", "")
+    + ":"
+    + _os.environ.get("PYTHONPATH", "")
+)
+for _p in _rad_paths.split(":"):
+    _p = _p.strip()
+    if _p and _p not in _sys.path:
+        _site.addsitedir(_p)
+
 from __TMPFILEBASE__ import ffi
 from mpi4py import MPI
 
