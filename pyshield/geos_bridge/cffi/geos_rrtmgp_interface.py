@@ -108,6 +108,31 @@ for _p in _rad_paths.split(":"):
 if hasattr(_os, "RTLD_DEEPBIND") and _os.environ.get("GEOS_RRTMGP_NO_DEEPBIND") != "1":
     _sys.setdlopenflags(_sys.getdlopenflags() | _os.RTLD_DEEPBIND)
 
+# Read the RRTMGP coefficient files with xarray's scipy backend (pure Python, no
+# HDF5). GEOS links its own HDF5 statically; any HDF5 the embedded interpreter
+# loads via the netcdf4/h5netcdf engines clashes with it ("NetCDF: HDF error").
+# The coefficient files are pre-converted to netCDF-3 (which scipy reads without
+# HDF5). Force the engine for xarray opens that do not name one. pyRTE calls a
+# plain xr.load_dataset(path), so this steers it. Override with
+# GEOS_RRTMGP_NETCDF_ENGINE ("auto" leaves xarray's default, e.g. for debugging).
+_rad_engine = _os.environ.get("GEOS_RRTMGP_NETCDF_ENGINE", "scipy")
+if _rad_engine and _rad_engine.lower() != "auto":
+    import xarray as _xr
+
+    _rad_orig_open = _xr.open_dataset
+    _rad_orig_load = _xr.load_dataset
+
+    def _rad_open(*a, **k):
+        k.setdefault("engine", _rad_engine)
+        return _rad_orig_open(*a, **k)
+
+    def _rad_load(*a, **k):
+        k.setdefault("engine", _rad_engine)
+        return _rad_orig_load(*a, **k)
+
+    _xr.open_dataset = _rad_open
+    _xr.load_dataset = _rad_load
+
 from __TMPFILEBASE__ import ffi
 from mpi4py import MPI
 
