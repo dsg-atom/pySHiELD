@@ -116,22 +116,52 @@ if hasattr(_os, "RTLD_DEEPBIND") and _os.environ.get("GEOS_RRTMGP_NO_DEEPBIND") 
 # plain xr.load_dataset(path), so this steers it. Override with
 # GEOS_RRTMGP_NETCDF_ENGINE ("auto" leaves xarray's default, e.g. for debugging).
 _rad_engine = _os.environ.get("GEOS_RRTMGP_NETCDF_ENGINE", "scipy")
-if _rad_engine and _rad_engine.lower() != "auto":
-    import xarray as _xr
+import pickle as _pickle
+import xarray as _xr
 
-    _rad_orig_open = _xr.open_dataset
-    _rad_orig_load = _xr.load_dataset
+_rad_orig_open = _xr.open_dataset
+_rad_orig_load = _xr.load_dataset
 
-    def _rad_open(*a, **k):
+
+def _rad_sidecar(a):
+    # If the first positional arg is a file path with a ".pkl" sidecar next to it,
+    # return the pre-serialized xarray Dataset instead of reading the file. The
+    # sidecars are built ON THE LOGIN NODE (where HDF5/netCDF work) by
+    # tools/pickle_rrtmgp_coeffs.py; unpickling runs no file-format library, so the
+    # embedded interpreter never touches HDF5 or scipy (both of which fail inside
+    # the GEOS process). Returns a Dataset, or None to fall through to xarray.
+    if not a:
+        return None
+    try:
+        sidecar = str(a[0]) + ".pkl"
+    except Exception:
+        return None
+    if _os.path.exists(sidecar):
+        with open(sidecar, "rb") as _fh:
+            return _pickle.load(_fh)
+    return None
+
+
+def _rad_open(*a, **k):
+    ds = _rad_sidecar(a)
+    if ds is not None:
+        return ds
+    if _rad_engine and _rad_engine.lower() != "auto":
         k.setdefault("engine", _rad_engine)
-        return _rad_orig_open(*a, **k)
+    return _rad_orig_open(*a, **k)
 
-    def _rad_load(*a, **k):
+
+def _rad_load(*a, **k):
+    ds = _rad_sidecar(a)
+    if ds is not None:
+        return ds
+    if _rad_engine and _rad_engine.lower() != "auto":
         k.setdefault("engine", _rad_engine)
-        return _rad_orig_load(*a, **k)
+    return _rad_orig_load(*a, **k)
 
-    _xr.open_dataset = _rad_open
-    _xr.load_dataset = _rad_load
+
+_xr.open_dataset = _rad_open
+_xr.load_dataset = _rad_load
 
 from __TMPFILEBASE__ import ffi
 from mpi4py import MPI
