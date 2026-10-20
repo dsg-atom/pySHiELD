@@ -134,6 +134,38 @@ class GEOSRRTMGP:
         """
         flip = self.top_at_1 if top_at_1 is None else top_at_1
 
+        if os.environ.get("GEOS_RRTMGP_DEBUG"):
+            global _RAD_DEBUG_DONE
+            if not _RAD_DEBUG_DONE:
+                _RAD_DEBUG_DONE = True
+                _pid = os.getpid()
+
+                def _stat(name, a):
+                    arr = np.asarray(a, dtype=np.float64)
+                    fin = np.isfinite(arr)
+                    lo = float(np.min(arr[fin])) if fin.any() else float("nan")
+                    hi = float(np.max(arr[fin])) if fin.any() else float("nan")
+                    print(
+                        f"[RRTMGP DBG {_pid}] {name}: shape={arr.shape} "
+                        f"min={lo:.5g} max={hi:.5g} nan={int(np.isnan(arr).sum())} "
+                        f"inf={int(np.isinf(arr).sum())} zero={int((arr == 0).sum())}",
+                        flush=True,
+                    )
+
+                for _k, _v in list(inputs.items()):
+                    _stat("in." + _k, _v)
+                for _k, _v in list(sfc_inputs.items()):
+                    _stat("sfc." + _k, _v)
+                for _k in ("prsi", "prsl", "tlyr"):
+                    if _k in inputs:
+                        _a = np.asarray(inputs[_k], dtype=np.float64)
+                        _prof = _a[0] if _a.ndim >= 2 else _a
+                        print(
+                            f"[RRTMGP DBG {_pid}] in.{_k}[col0]="
+                            f"{np.asarray(_prof).tolist()}",
+                            flush=True,
+                        )
+
         marshal.marshal_inputs(
             self.state,
             self.sfc_state,
@@ -172,6 +204,7 @@ class GEOSRRTMGP:
 # geos_gtfv3.py (GEOS_DYCORE / geos_gtfv3_init / geos_gtfv3 / _finalize).
 # ---------------------------------------------------------------------------
 GEOS_RRTMGP = None
+_RAD_DEBUG_DONE = False
 
 
 def geos_rrtmgp_init(
