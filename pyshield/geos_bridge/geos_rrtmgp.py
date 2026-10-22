@@ -189,9 +189,26 @@ class GEOSRRTMGP:
 
         self._driver.step_radiation(self.state, self.sfc_state, date)
 
-        return marshal.extract_outputs(
+        outputs = marshal.extract_outputs(
             self.state, self.nx, self.ny, self.nz, flip
         )
+
+        if os.environ.get("GEOS_RRTMGP_DEBUG"):
+            global _RAD_DEBUG_OUT_DONE
+            if not _RAD_DEBUG_OUT_DONE:
+                _RAD_DEBUG_OUT_DONE = True
+                _pid = os.getpid()
+                for _k in ("flwu", "flwd", "fswu", "fswd"):
+                    if _k in outputs:
+                        _a = np.asarray(outputs[_k], dtype=np.float64)
+                        print(
+                            f"[RRTMGP DBG OUT {_pid}] {_k}: shape={_a.shape} "
+                            f"min={float(_a.min()):.5g} max={float(_a.max()):.5g} "
+                            f"mean={float(_a.mean()):.5g}",
+                            flush=True,
+                        )
+
+        return outputs
 
     def finalize(self):
         # No external resources to release in Phase 0; present for symmetry with
@@ -205,6 +222,7 @@ class GEOSRRTMGP:
 # ---------------------------------------------------------------------------
 GEOS_RRTMGP = None
 _RAD_DEBUG_DONE = False
+_RAD_DEBUG_OUT_DONE = False
 
 
 def geos_rrtmgp_init(
