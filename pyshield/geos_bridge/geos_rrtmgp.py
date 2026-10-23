@@ -262,13 +262,21 @@ def geos_rrtmgp_init(
         # ndsl's get_factories_single_tile needs a Backend OBJECT, not a name
         # string (same lesson as the rte_solver/gas_optics GPU tests). Map the
         # env/string name to the ndsl.config object.
-        from ndsl.config import backend_gpu, backend_python
+        #
+        # NOTE: "numpy"/"python" is the gt4py INTERPRETED backend (per-element
+        # Python) -- fine for small unit tests but far too slow for a full GEOS
+        # tile in-model (one radiation call exceeds the wall clock). Use a
+        # COMPILED backend for real runs: "cpu" (gt:cpu, compiles C++ once then
+        # fast) or "gpu".
+        from ndsl.config import backend_cpu, backend_gpu, backend_python
 
-        backend = (
-            backend_gpu
-            if backend.lower() in ("gpu", "gt:gpu", "dace:gpu")
-            else backend_python
-        )
+        _b = backend.lower()
+        if _b in ("gpu", "gt:gpu", "dace:gpu"):
+            backend = backend_gpu
+        elif _b in ("python", "numpy", "debug"):
+            backend = backend_python
+        else:  # "cpu", "gt:cpu", "dace:cpu" -> compiled CPU
+            backend = backend_cpu
 
     if sigma is None:
         if ak is None or bk is None:
