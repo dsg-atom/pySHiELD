@@ -30,8 +30,16 @@ import os
 import numpy as np
 import pytest
 
-from ndsl.config import backend_python
+from ndsl.config import backend_python, backend_gpu
 from ndsl.dsl.typing import Float
+
+
+# GPU runs: set RTE_TEST_BACKEND (e.g. dace:gpu) on an A100 node to drive the FULL
+# step_radiation (gas optics + cloud optics + all four solves) on GPU instead of
+# the interpreted numpy backend. The bit-for-bit bridge==direct assertion still
+# holds (both legs run on the same backend); this proves the whole radiation path
+# compiles + runs + stays finite on GPU.
+_BRIDGE_BACKEND = backend_gpu if os.environ.get("RTE_TEST_BACKEND") else backend_python
 
 
 # NDSL requires nx > nhalo (SubtileGridSizer), so the tile must exceed the halo.
@@ -145,7 +153,7 @@ def test_bridge_matches_direct_step_radiation(tmp_path):
         lats=lats,
         sigma=sigma,
         nhalo=NHALO,
-        backend=backend_python,
+        backend=_BRIDGE_BACKEND,
         top_at_1=True,
     )
 
@@ -153,7 +161,7 @@ def test_bridge_matches_direct_step_radiation(tmp_path):
     with pytest.raises(RuntimeError):
         geos_rrtmgp.geos_rrtmgp_init(
             config=config, nx=NX, ny=NY, nz=NZ, lons=lons, lats=lats, sigma=sigma,
-            nhalo=NHALO, backend=backend_python, top_at_1=True,
+            nhalo=NHALO, backend=_BRIDGE_BACKEND, top_at_1=True,
         )
 
     out_bridge = geos_rrtmgp.geos_rrtmgp_run(inputs, sfc_inputs, date, top_at_1=True)
