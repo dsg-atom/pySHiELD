@@ -37,7 +37,7 @@ from ndsl.config import backend_python, backend_gpu
 # stencils for the GPU; unset = the default CPU backend used for correctness.
 backend_python = backend_gpu if os.environ.get("RTE_TEST_BACKEND") else backend_python
 
-from pyshield.radiation.sw_solver_gt4py import SWTwoStreamSolverGT4Py
+from pyshield.radiation.sw_solver_gt4py import SWTwoStreamSolverGT4Py, to_host
 
 SITES = [0, 25, 50, 75]
 EXPTS = [0, 6, 12, 17]
@@ -168,6 +168,8 @@ def test_sw_solver_gt4py():
         sfc_alb_dif=alb_gpt,
         inc_flux_dir=inc_dir,
     )
+    # Solver returns backend-native arrays (cupy on GPU); pull to host to compare.
+    bb_up, bb_dn, bb_dir = to_host(bb_up), to_host(bb_dn), to_host(bb_dir)
 
     np.testing.assert_allclose(bb_up, ref_up, rtol=1e-10, atol=1e-12, err_msg="sw_flux_up")
     np.testing.assert_allclose(bb_dn, ref_dn, rtol=1e-10, atol=1e-12, err_msg="sw_flux_down")

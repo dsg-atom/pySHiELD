@@ -53,6 +53,7 @@ from pyshield.radiation.lw_solver_gt4py import (
     D_DEFAULT,
     WEIGHT_DEFAULT,
     LWNoScatSolverGT4Py,
+    to_host,
 )
 
 SITES = [0, 25, 50, 75]
@@ -227,6 +228,8 @@ def test_lw_solver_allsky_gt4py():
     bb_up, bb_dn = solver.solve(
         tau=tau, lay_source=lay, lev_source=lev, sfc_src=sfc, sfc_emis=emis,
     )
+    # Solver returns backend-native arrays (cupy on GPU); pull to host to compare.
+    bb_up, bb_dn = to_host(bb_up), to_host(bb_dn)
 
     # --- pyRTE reference solve on the COMBINED optics ------------------------
     fluxes = lw.rte.solve(add_to_input=False)

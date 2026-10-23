@@ -24,6 +24,7 @@ from ndsl.boilerplate import get_factories_single_tile
 from ndsl.constants import I_DIM, J_DIM, K_DIM
 from ndsl.dsl.typing import Float
 
+from ._device import array_module, to_host  # noqa: F401 (to_host re-exported for tests)
 from .sw_solver import (
     sw_2stream_gpoint_top_at_1,
     sw_2stream_gpoint_top_at_n,
@@ -122,13 +123,16 @@ class SWTwoStreamSolverGT4Py:
         in W/m2. broadband_dn is the TOTAL (diffuse + direct) downward flux.
         """
         nx, ny, nz, nlev, ngpt = self.nx, self.ny, self.nz, self.nlev, self.ngpt
-        tau = np.asarray(tau, dtype=np.float64)
-        ssa = np.asarray(ssa, dtype=np.float64)
-        g = np.asarray(g, dtype=np.float64)
-        mu0 = np.asarray(mu0, dtype=np.float64)
-        sfc_alb_dir = np.asarray(sfc_alb_dir, dtype=np.float64)
-        sfc_alb_dif = np.asarray(sfc_alb_dif, dtype=np.float64)
-        inc_flux_dir = np.asarray(inc_flux_dir, dtype=np.float64)
+        # Move inputs onto the backend's device (cupy on GPU) so the per-g-point
+        # slice assignments into the device Quantity views are device->device.
+        xp = array_module(self._tau)
+        tau = xp.asarray(tau, dtype=np.float64)
+        ssa = xp.asarray(ssa, dtype=np.float64)
+        g = xp.asarray(g, dtype=np.float64)
+        mu0 = xp.asarray(mu0, dtype=np.float64)
+        sfc_alb_dir = xp.asarray(sfc_alb_dir, dtype=np.float64)
+        sfc_alb_dif = xp.asarray(sfc_alb_dif, dtype=np.float64)
+        inc_flux_dir = xp.asarray(inc_flux_dir, dtype=np.float64)
 
         assert tau.shape == (nx, ny, nz, ngpt), tau.shape
         assert ssa.shape == (nx, ny, nz, ngpt), ssa.shape
@@ -178,7 +182,8 @@ class SWTwoStreamSolverGT4Py:
                 broadband_dir=self._bb_dir,
             )
 
-        bb_up = np.array(self._bb_up.view[:, :, :nlev])
-        bb_dn = np.array(self._bb_dn.view[:, :, :nlev])
-        bb_dir = np.array(self._bb_dir.view[:, :, :nlev])
+        # Backend-native copies (cupy on GPU), detached from the reused buffers.
+        bb_up = xp.array(self._bb_up.view[:, :, :nlev])
+        bb_dn = xp.array(self._bb_dn.view[:, :, :nlev])
+        bb_dir = xp.array(self._bb_dir.view[:, :, :nlev])
         return bb_up, bb_dn, bb_dir

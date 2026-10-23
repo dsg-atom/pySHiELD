@@ -25,22 +25,7 @@ from ndsl.boilerplate import get_factories_single_tile
 from ndsl.constants import I_DIM, J_DIM, K_DIM
 from ndsl.dsl.typing import Float
 
-try:
-    import cupy as _cp  # device arrays under a GPU backend; absent on CPU-only installs
-except ImportError:  # pragma: no cover - CPU-only environments
-    _cp = None
-
-
-def to_host(a):
-    """Return a host numpy array for a numpy or cupy array (no-op for numpy).
-
-    Used at host boundaries (test assertions, diagnostics) to pull a solver
-    result off the device. Inside the solver and driver, arrays stay native to
-    the backend (cupy on GPU) so Quantity views assign device->device.
-    """
-    if _cp is not None and isinstance(a, _cp.ndarray):
-        return _cp.asnumpy(a)
-    return np.asarray(a)
+from ._device import array_module, to_host  # noqa: F401 (to_host re-exported for tests)
 
 from .lw_solver import (
     lw_noscat_gpoint_top_at_1,
@@ -124,12 +109,6 @@ class LWNoScatSolverGT4Py:
     def _ff(self):
         return self._qf.zeros([I_DIM, J_DIM, K_DIM], "", dtype=Float)
 
-    def _xp(self):
-        """Array module the Quantities use: cupy on a GPU backend, else numpy."""
-        if _cp is not None and isinstance(self._tau.view[:], _cp.ndarray):
-            return _cp
-        return np
-
     def solve(self, tau, lay_source, lev_source, sfc_src, sfc_emis, inc_flux=None):
         """Broadband longwave up/down flux from tau and the Planck sources.
 
@@ -145,7 +124,7 @@ class LWNoScatSolverGT4Py:
         # slice assignments into the device Quantity views are device->device.
         # xp.asarray is a no-op when the input is already on the right device
         # (e.g. gas-optics output on GPU) and a host->device copy otherwise.
-        xp = self._xp()
+        xp = array_module(self._tau)
         tau = xp.asarray(tau, dtype=np.float64)
         lay_source = xp.asarray(lay_source, dtype=np.float64)
         lev_source = xp.asarray(lev_source, dtype=np.float64)
