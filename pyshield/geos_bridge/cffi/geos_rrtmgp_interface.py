@@ -98,6 +98,23 @@ for _p in _rad_paths.split(":"):
         _sys.path.insert(0, _p)  # ahead of GEOSpyD base so the venv's numpy/ndsl win
     _site.addsitedir(_p)         # also process .pth (the editable pyshield pointer)
 
+# Per-rank gt4py cache root. Every MPI rank embeds its own CPython, and under the
+# DaCe backend all ranks would build stencils into ONE shared cache dir named by
+# the orchestration config (.gt_cache_FV3_A) -- NOT by rank. 48 ranks writing the
+# same compiled .so at once truncate each other's files ("invalid ELF header" /
+# "file too short"). Give every rank its OWN cache root so builds never collide.
+# Keyed off the MPI rank: Intel MPI PMI_RANK, then SLURM_PROCID, then pid. Only
+# applied when a base GT_CACHE_ROOT is set (the in-model run sets it); standalone
+# and laptop use leave GT_CACHE_ROOT unset and are untouched.
+_rad_base_cache = _os.environ.get("GT_CACHE_ROOT", "").strip()
+if _rad_base_cache:
+    _rad_rank = (
+        _os.environ.get("PMI_RANK")
+        or _os.environ.get("SLURM_PROCID")
+        or str(_os.getpid())
+    )
+    _os.environ["GT_CACHE_ROOT"] = _os.path.join(_rad_base_cache, "rank" + _rad_rank)
+
 # GEOS links its own HDF5 STATICALLY, so those symbols are global in the running
 # process and would override the venv netCDF4's bundled HDF5 (a different version)
 # -> "NetCDF: HDF error" when pyRTE reads the RRTMGP coefficient files. Load
