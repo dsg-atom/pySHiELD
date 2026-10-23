@@ -126,7 +126,7 @@ class LWNoScatSolverGT4Py:
 
     def _xp(self):
         """Array module the Quantities use: cupy on a GPU backend, else numpy."""
-        if _cp is not None and isinstance(self._tau.data, _cp.ndarray):
+        if _cp is not None and isinstance(self._tau.view[:], _cp.ndarray):
             return _cp
         return np
 
