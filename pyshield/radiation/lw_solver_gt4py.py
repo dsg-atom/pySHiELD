@@ -25,6 +25,23 @@ from ndsl.boilerplate import get_factories_single_tile
 from ndsl.constants import I_DIM, J_DIM, K_DIM
 from ndsl.dsl.typing import Float
 
+try:
+    import cupy as _cp  # device arrays under a GPU backend; absent on CPU-only installs
+except ImportError:  # pragma: no cover - CPU-only environments
+    _cp = None
+
+
+def to_host(a):
+    """Return a host numpy array for a numpy or cupy array (no-op for numpy).
+
+    Used at host boundaries (test assertions, diagnostics) to pull a solver
+    result off the device. Inside the solver and driver, arrays stay native to
+    the backend (cupy on GPU) so Quantity views assign device->device.
+    """
+    if _cp is not None and isinstance(a, _cp.ndarray):
+        return _cp.asnumpy(a)
+    return np.asarray(a)
+
 from .lw_solver import (
     lw_noscat_gpoint_top_at_1,
     lw_noscat_gpoint_top_at_n,
@@ -107,6 +124,12 @@ class LWNoScatSolverGT4Py:
     def _ff(self):
         return self._qf.zeros([I_DIM, J_DIM, K_DIM], "", dtype=Float)
 
+    def _xp(self):
+        """Array module the Quantities use: cupy on a GPU backend, else numpy."""
+        if _cp is not None and isinstance(self._tau.data, _cp.ndarray):
+            return _cp
+        return np
+
     def solve(self, tau, lay_source, lev_source, sfc_src, sfc_emis, inc_flux=None):
         """Broadband longwave up/down flux from tau and the Planck sources.
 
@@ -118,15 +141,20 @@ class LWNoScatSolverGT4Py:
         broadband_dn, each (nx, ny, nlev) in W/m2.
         """
         nx, ny, nz, nlev, ngpt = self.nx, self.ny, self.nz, self.nlev, self.ngpt
-        tau = np.asarray(tau, dtype=np.float64)
-        lay_source = np.asarray(lay_source, dtype=np.float64)
-        lev_source = np.asarray(lev_source, dtype=np.float64)
-        sfc_src = np.asarray(sfc_src, dtype=np.float64)
-        sfc_emis = np.asarray(sfc_emis, dtype=np.float64)
+        # Move inputs onto the backend's device (cupy on GPU) so the per-g-point
+        # slice assignments into the device Quantity views are device->device.
+        # xp.asarray is a no-op when the input is already on the right device
+        # (e.g. gas-optics output on GPU) and a host->device copy otherwise.
+        xp = self._xp()
+        tau = xp.asarray(tau, dtype=np.float64)
+        lay_source = xp.asarray(lay_source, dtype=np.float64)
+        lev_source = xp.asarray(lev_source, dtype=np.float64)
+        sfc_src = xp.asarray(sfc_src, dtype=np.float64)
+        sfc_emis = xp.asarray(sfc_emis, dtype=np.float64)
         if inc_flux is None:
-            inc_flux = np.zeros((nx, ny, ngpt), dtype=np.float64)
+            inc_flux = xp.zeros((nx, ny, ngpt), dtype=np.float64)
         else:
-            inc_flux = np.asarray(inc_flux, dtype=np.float64)
+            inc_flux = xp.asarray(inc_flux, dtype=np.float64)
 
         assert tau.shape == (nx, ny, nz, ngpt), tau.shape
         assert lay_source.shape == (nx, ny, nz, ngpt), lay_source.shape
@@ -163,6 +191,10 @@ class LWNoScatSolverGT4Py:
 
         self._scale(broadband_up=self._bb_up, broadband_dn=self._bb_dn)
 
-        bb_up = np.array(self._bb_up.view[:, :, :nlev])
-        bb_dn = np.array(self._bb_dn.view[:, :, :nlev])
+        # Return backend-native copies (cupy on GPU): a copy so the result is
+        # detached from the persistent buffers reused next call. Host boundaries
+        # (tests, diagnostics) pull these to numpy via to_host(); the in-model
+        # driver assigns them straight into device state views.
+        bb_up = xp.array(self._bb_up.view[:, :, :nlev])
+        bb_dn = xp.array(self._bb_dn.view[:, :, :nlev])
         return bb_up, bb_dn

@@ -42,6 +42,7 @@ from pyshield.radiation.lw_solver_gt4py import (
     D_DEFAULT,
     WEIGHT_DEFAULT,
     LWNoScatSolverGT4Py,
+    to_host,
 )
 
 SITES = [0, 25, 50, 75]
@@ -112,6 +113,9 @@ def test_lw_solver_gt4py():
     bb_up, bb_dn = solver.solve(
         tau=tau, lay_source=lay, lev_source=lev, sfc_src=sfc, sfc_emis=emis,
     )
+    # Solver returns backend-native arrays (cupy on a GPU backend); pull to host
+    # for comparison against pyRTE's numpy reference.
+    bb_up, bb_dn = to_host(bb_up), to_host(bb_dn)
 
     # pyRTE reference: solve its own gas optics. Detect the flux level dim from
     # the output rather than assuming it matches lw.mapping's level name.
