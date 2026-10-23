@@ -40,6 +40,8 @@ from ndsl.dsl.typing import Float, Int
 
 from pyrte_rrtmgp.rrtmgp import CloudOptics
 
+from ._device import array_module, to_host
+
 from .cloud_optics import (
     NBND_CLD,
     NSIZE_CLD,
@@ -304,9 +306,12 @@ class CloudOpticsGT4Py:
         lwp_q, fint_q = self._ff(), self._ff()
         idx_q, iband_q = self._fi(), self._fi()
         tau_q, taussa_q, taussag_q = self._ff(), self._ff(), self._ff()
-        lwp_q.view[:] = wp
-        fint_q.view[:] = fint
-        idx_q.view[:] = idx0
+        # Inputs onto the backend device for the device Quantity views; results
+        # come back to host (the caller folds them into a pyRTE xarray dataset).
+        xp = array_module(lwp_q)
+        lwp_q.view[:] = xp.asarray(wp)
+        fint_q.view[:] = xp.asarray(fint)
+        idx_q.view[:] = xp.asarray(idx0)
 
         tau = np.zeros((nx, ny, nz, nbnd), dtype=np.float64)
         taussa = np.zeros((nx, ny, nz, nbnd), dtype=np.float64)
@@ -318,9 +323,9 @@ class CloudOpticsGT4Py:
                 ext=ext, ssa=ssa, asy=asy,
                 tau=tau_q, taussa=taussa_q, taussag=taussag_q,
             )
-            tau[:, :, :, b] = tau_q.view[:]
-            taussa[:, :, :, b] = taussa_q.view[:]
-            taussag[:, :, :, b] = taussag_q.view[:]
+            tau[:, :, :, b] = to_host(tau_q.view[:])
+            taussa[:, :, :, b] = to_host(taussa_q.view[:])
+            taussag[:, :, :, b] = to_host(taussag_q.view[:])
         return tau, taussa, taussag
 
     # ---------------------------------------------------------------- add_to
@@ -377,25 +382,28 @@ class CloudOpticsGT4Py:
         if self._is_2str:
             s1_q, g1_q, s2_q, g2_q = self._ff(), self._ff(), self._ff(), self._ff()
 
+        # Inputs onto the backend device for the device Quantity views; results
+        # come back to host to be written into the pyRTE gas-optics dataset.
+        xp = array_module(t1_q)
         for gpt in range(ngpt):
             b = int(gpt2band[gpt])
-            t1_q.view[:] = gtau[:, :, :, gpt]
-            t2_q.view[:] = ctau[:, :, :, b]
+            t1_q.view[:] = xp.asarray(gtau[:, :, :, gpt])
+            t2_q.view[:] = xp.asarray(ctau[:, :, :, b])
             if self._is_2str:
-                s1_q.view[:] = gssa[:, :, :, gpt]
-                g1_q.view[:] = gg[:, :, :, gpt]
-                s2_q.view[:] = cssa[:, :, :, b]
-                g2_q.view[:] = cg[:, :, :, b]
+                s1_q.view[:] = xp.asarray(gssa[:, :, :, gpt])
+                g1_q.view[:] = xp.asarray(gg[:, :, :, gpt])
+                s2_q.view[:] = xp.asarray(cssa[:, :, :, b])
+                g2_q.view[:] = xp.asarray(cg[:, :, :, b])
                 self._inc2(
                     tau1=t1_q, ssa1=s1_q, g1=g1_q,
                     tau2=t2_q, ssa2=s2_q, g2=g2_q,
                 )
-                gtau[:, :, :, gpt] = t1_q.view[:]
-                gssa[:, :, :, gpt] = s1_q.view[:]
-                gg[:, :, :, gpt] = g1_q.view[:]
+                gtau[:, :, :, gpt] = to_host(t1_q.view[:])
+                gssa[:, :, :, gpt] = to_host(s1_q.view[:])
+                gg[:, :, :, gpt] = to_host(g1_q.view[:])
             else:
                 self._inc1(tau1=t1_q, tau2=t2_q)
-                gtau[:, :, :, gpt] = t1_q.view[:]
+                gtau[:, :, :, gpt] = to_host(t1_q.view[:])
 
         # write combined optics back into the gas-optics dataset in place.
         self._write(gas_optics, "tau", gtau, [glayer, gspec])

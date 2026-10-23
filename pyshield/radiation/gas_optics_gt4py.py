@@ -48,6 +48,7 @@ from ndsl.dsl.typing import Float, Int
 
 from pyrte_rrtmgp.rrtmgp import DEFAULT_GAS_MAPPING, GasOptics
 
+from ._device import array_module, to_host
 from .gas_optics import (
     NBND,
     NMINORK,
@@ -392,19 +393,24 @@ class GasOpticsGT4Py:
         )
         fmn_q = {n: self._ff(qf) for n in ("fmn11", "fmn21", "fmn12", "fmn22")}
         res_q = self._ff(qf)
-        jtemp_q.view[:] = iv["jtemp0"]
+        # Gathers stay on host (numpy advanced indexing); each per-g-point slab
+        # uploads to the device via xp.asarray before the device Quantity view
+        # assignment, and accumulator reads come back with to_host. Scalar fills
+        # (view[:] = g) are fine as-is on cupy.
+        xp = array_module(res_q)
+        jtemp_q.view[:] = xp.asarray(iv["jtemp0"])
 
         # --- major gas ------------------------------------------------------
         tau_major = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
-        jpress_q.view[:] = iv["jpress0"]
+        jpress_q.view[:] = xp.asarray(iv["jpress0"])
         for g in range(ngpt):
             iflav = (gpf[g, iv["itropo"]] - 1).astype(np.int64)
-            s1_q.view[:] = col_mix[:, :, 0][si, ei, li, iflav]
-            s2_q.view[:] = col_mix[:, :, 1][si, ei, li, iflav]
+            s1_q.view[:] = xp.asarray(col_mix[:, :, 0][si, ei, li, iflav])
+            s2_q.view[:] = xp.asarray(col_mix[:, :, 1][si, ei, li, iflav])
             for name, (e, p, t) in _FMAJ_AXES.items():
-                fmaj_q[name].view[:] = fmajor[:, :, e, p, t][si, ei, li, iflav]
-            jeta1_q.view[:] = (jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64)
-            jeta2_q.view[:] = (jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64)
+                fmaj_q[name].view[:] = xp.asarray(fmajor[:, :, e, p, t][si, ei, li, iflav])
+            jeta1_q.view[:] = xp.asarray((jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64))
+            jeta2_q.view[:] = xp.asarray((jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64))
             igpt_q.view[:] = g
             self._major(
                 scaling1=s1_q, scaling2=s2_q,
@@ -414,7 +420,7 @@ class GasOpticsGT4Py:
                 jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q,
                 igpt=igpt_q, kmajor=self._kmajor, res=res_q,
             )
-            tau_major[:, :, :, g] = res_q.view[:]
+            tau_major[:, :, :, g] = to_host(res_q.view[:])
 
         # --- minor gas (lower then upper) -----------------------------------
         col_gas = self._tile(interp["gases_columns"], [ld, "gas"]).astype(np.float64)
@@ -457,12 +463,12 @@ class GasOpticsGT4Py:
                         scaling = scaling * ((1.0 - fac) if scomp[imnr] else fac)
                 scaling = np.where(layer_mask, scaling, 0.0)
 
-                fmn_q["fmn11"].view[:] = fminor[:, :, 0, 0][si, ei, li, iflav]
-                fmn_q["fmn21"].view[:] = fminor[:, :, 1, 0][si, ei, li, iflav]
-                fmn_q["fmn12"].view[:] = fminor[:, :, 0, 1][si, ei, li, iflav]
-                fmn_q["fmn22"].view[:] = fminor[:, :, 1, 1][si, ei, li, iflav]
-                jeta1_q.view[:] = (jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64)
-                jeta2_q.view[:] = (jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64)
+                fmn_q["fmn11"].view[:] = xp.asarray(fminor[:, :, 0, 0][si, ei, li, iflav])
+                fmn_q["fmn21"].view[:] = xp.asarray(fminor[:, :, 1, 0][si, ei, li, iflav])
+                fmn_q["fmn12"].view[:] = xp.asarray(fminor[:, :, 0, 1][si, ei, li, iflav])
+                fmn_q["fmn22"].view[:] = xp.asarray(fminor[:, :, 1, 1][si, ei, li, iflav])
+                jeta1_q.view[:] = xp.asarray((jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64))
+                jeta2_q.view[:] = xp.asarray((jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64))
 
                 for g in range(gptS0, gptE0 + 1):
                     kg_q.view[:] = ks0 + (g - gptS0)
@@ -472,7 +478,7 @@ class GasOpticsGT4Py:
                         jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
                         kminor=kmin, res=res_q,
                     )
-                    tau_minor[:, :, :, g] += scaling * res_q.view[:]
+                    tau_minor[:, :, :, g] += scaling * to_host(res_q.view[:])
 
         return tau_major + tau_minor
 
@@ -502,19 +508,20 @@ class GasOpticsGT4Py:
             self._fi(qf), self._fi(qf), self._fi(qf), self._fi(qf)
         )
         res_q = self._ff(qf)
-        jtemp_q.view[:] = jtemp0
+        xp = array_module(res_q)
+        jtemp_q.view[:] = xp.asarray(jtemp0)
 
         tau_rayl = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
         for g in range(ngpt):
             k_half = {}
             for b, bi in (("lower", 0), ("upper", 1)):
                 iflav = (gpf[g, bi] - 1).astype(np.int64)
-                fmn_q["fmn11"].view[:] = fminor[:, :, 0, 0][si, ei, li, iflav]
-                fmn_q["fmn21"].view[:] = fminor[:, :, 1, 0][si, ei, li, iflav]
-                fmn_q["fmn12"].view[:] = fminor[:, :, 0, 1][si, ei, li, iflav]
-                fmn_q["fmn22"].view[:] = fminor[:, :, 1, 1][si, ei, li, iflav]
-                jeta1_q.view[:] = (jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64)
-                jeta2_q.view[:] = (jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64)
+                fmn_q["fmn11"].view[:] = xp.asarray(fminor[:, :, 0, 0][si, ei, li, iflav])
+                fmn_q["fmn21"].view[:] = xp.asarray(fminor[:, :, 1, 0][si, ei, li, iflav])
+                fmn_q["fmn12"].view[:] = xp.asarray(fminor[:, :, 0, 1][si, ei, li, iflav])
+                fmn_q["fmn22"].view[:] = xp.asarray(fminor[:, :, 1, 1][si, ei, li, iflav])
+                jeta1_q.view[:] = xp.asarray((jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64))
+                jeta2_q.view[:] = xp.asarray((jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64))
                 kg_q.view[:] = g
                 self._rayl(
                     fmn11=fmn_q["fmn11"], fmn21=fmn_q["fmn21"],
@@ -522,7 +529,7 @@ class GasOpticsGT4Py:
                     jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
                     krayl=self._krayl[b], res=res_q,
                 )
-                k_half[b] = res_q.view[:].copy()
+                k_half[b] = np.array(to_host(res_q.view[:]))
             k = np.where(tropo, k_half["lower"], k_half["upper"])
             tau_rayl[:, :, :, g] = k * (col_h2o + col_dry)
         return tau_rayl
@@ -547,16 +554,17 @@ class GasOpticsGT4Py:
         jtemp_q, jpress_q = self._fi(qf), self._fi(qf)
         jeta1_q, jeta2_q, igpt_q = self._fi(qf), self._fi(qf), self._fi(qf)
         res_q = self._ff(qf)
-        jtemp_q.view[:] = iv["jtemp0"]
-        jpress_q.view[:] = iv["jpress0"]
+        xp = array_module(res_q)
+        jtemp_q.view[:] = xp.asarray(iv["jtemp0"])
+        jpress_q.view[:] = xp.asarray(iv["jpress0"])
 
         pfrac = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
         for g in range(ngpt):
             iflav = (gpf[g, iv["itropo"]] - 1).astype(np.int64)
             for name, (e, p, t) in _FMAJ_AXES.items():
-                fmaj_q[name].view[:] = fmajor[:, :, e, p, t][si, ei, li, iflav]
-            jeta1_q.view[:] = (jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64)
-            jeta2_q.view[:] = (jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64)
+                fmaj_q[name].view[:] = xp.asarray(fmajor[:, :, e, p, t][si, ei, li, iflav])
+            jeta1_q.view[:] = xp.asarray((jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64))
+            jeta2_q.view[:] = xp.asarray((jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64))
             igpt_q.view[:] = g
             self._major(
                 scaling1=s1_q, scaling2=s2_q,
@@ -566,7 +574,7 @@ class GasOpticsGT4Py:
                 jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q,
                 igpt=igpt_q, kmajor=self._pfracin, res=res_q,
             )
-            pfrac[:, :, :, g] = res_q.view[:]
+            pfrac[:, :, :, g] = to_host(res_q.view[:])
 
         # temperatures (upcast to float64 to match the Fortran index math)
         tlay_var = atmosphere.mapping.get_var("temp_layer")
@@ -590,19 +598,19 @@ class GasOpticsGT4Py:
         frac_sfcd_q, idx_sfcd_q = self._ff(qf), self._fi(qf)
         iband_q = self._fi(qf)
         planck_lay_q, planck_sfc_q, planck_sfcd_q = self._ff(qf), self._ff(qf), self._ff(qf)
-        frac_lay_q.view[:] = frac_lay
-        idx_lay_q.view[:] = idx_lay
-        frac_sfc_q.view[:] = frac_sfc
-        idx_sfc_q.view[:] = idx_sfc
-        frac_sfcd_q.view[:] = frac_sfcd
-        idx_sfcd_q.view[:] = idx_sfcd
+        frac_lay_q.view[:] = xp.asarray(frac_lay)
+        idx_lay_q.view[:] = xp.asarray(idx_lay)
+        frac_sfc_q.view[:] = xp.asarray(frac_sfc)
+        idx_sfc_q.view[:] = xp.asarray(idx_sfc)
+        frac_sfcd_q.view[:] = xp.asarray(frac_sfcd)
+        idx_sfcd_q.view[:] = xp.asarray(idx_sfcd)
 
         qfl = self._qf_lev
         frac_lev_q, idx_lev_q = self._ff(qfl), self._fi(qfl)
         iband_lev_q, planck_lev_q = self._fi(qfl), self._ff(qfl)
         idx_lev, frac_lev = self._idx_frac(tlev, tmin, delta, ntp)
-        frac_lev_q.view[:] = frac_lev
-        idx_lev_q.view[:] = idx_lev
+        frac_lev_q.view[:] = xp.asarray(frac_lev)
+        idx_lev_q.view[:] = xp.asarray(idx_lev)
 
         sfc_src = np.zeros((nx, ny, ngpt), dtype=np.float64)
         jac_src = np.zeros((nx, ny, ngpt), dtype=np.float64)
@@ -623,10 +631,10 @@ class GasOpticsGT4Py:
             self._planck_lev(frac=frac_lev_q, idx=idx_lev_q, iband=iband_lev_q,
                              totplnk=self._totplnk, planck=planck_lev_q)
 
-            pl_lay = planck_lay_q.view[:]
-            pl_sfc = planck_sfc_q.view[:, :, 0]
-            pl_sfcd = planck_sfcd_q.view[:, :, 0]
-            pl_lev = planck_lev_q.view[:]
+            pl_lay = to_host(planck_lay_q.view[:])
+            pl_sfc = to_host(planck_sfc_q.view[:, :, 0])
+            pl_sfcd = to_host(planck_sfcd_q.view[:, :, 0])
+            pl_lev = to_host(planck_lev_q.view[:])
 
             for g in range(gptS0, gptE0 + 1):
                 pf = pfrac[:, :, :, g]
