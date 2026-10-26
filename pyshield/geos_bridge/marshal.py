@@ -38,6 +38,8 @@ import numpy as np
 import ndsl.dsl.gt4py_utils as gt_utils
 from ndsl.constants import K_DIM, K_INTERFACE_DIM
 
+from pyshield.radiation._device import array_module
+
 
 # ---------------------------------------------------------------------------
 # Field groups. These name the RTE_RRTMGPState / SurfaceState fields the bridge
@@ -154,6 +156,9 @@ def marshal_field_in(quantity, dims, arr, nx, ny, nz, top_at_1):
             bottom-up ordering; if False no flip.
     """
     kind = _kind(dims)
+    # On a GPU backend the Quantity view is a cupy array; move the host input
+    # onto the device before filling (xp is numpy on CPU, a no-op).
+    xp = array_module(quantity)
     view = quantity.view[:]
     arr = np.asarray(arr)
     if kind == "col":
@@ -162,14 +167,14 @@ def marshal_field_in(quantity, dims, arr, nx, ny, nz, top_at_1):
             raise ValueError(
                 f"2-D field expected shape {expected}, got {arr.shape}"
             )
-        view[:] = arr.reshape(nx, ny)
+        view[:] = xp.asarray(arr.reshape(nx, ny))
         return
     nlev = _nlev(kind, nz)
     expected = (nx * ny, nlev)
     if arr.shape != expected:
         raise ValueError(f"3-D field expected shape {expected}, got {arr.shape}")
     src = arr[:, ::-1] if top_at_1 else arr
-    view[:] = src.reshape(nx, ny, nlev)
+    view[:] = xp.asarray(src.reshape(nx, ny, nlev))
 
 
 def marshal_field_out(quantity, dims, nx, ny, nz, top_at_1):

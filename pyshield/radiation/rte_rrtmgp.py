@@ -10,6 +10,8 @@ import ndsl.constants as constants
 from ndsl import QuantityFactory, StencilFactory
 from ndsl.constants import I_DIM, J_DIM, K_DIM
 from ndsl.dsl.gt4py import FORWARD, PARALLEL, computation
+
+from ._device import array_module
 from ndsl.dsl.gt4py import function as gtfunction
 from ndsl.dsl.gt4py import interval, log
 from ndsl.dsl.typing import Bool, Float, FloatField, FloatFieldIJ
@@ -294,8 +296,9 @@ class RTE_RRTMGPDriver:
             gridlat.view[:],
         )
 
-        self._co2_cyc.view[:] = co2_cyc
-        self._co2_arr.view[:] = co2_arr
+        _xp = array_module(self._co2_cyc)
+        self._co2_cyc.view[:] = _xp.asarray(co2_cyc)
+        self._co2_arr.view[:] = _xp.asarray(co2_arr)
 
         # Init sfc albedo and emissivity
         self.albedo = np.zeros((gridlon.view[:].shape[0], gridlon.view[:].shape[1], 4))
@@ -622,7 +625,7 @@ class RTE_RRTMGPDriver:
             self.ldisable_radiation_quasi_sea_ice,
         )
         if self.ialbflg == -1 or self.ialbflg == -2:
-            state.albedo.view[:] = self.albedo[:, :, 0]
+            state.albedo.view[:] = array_module(state.albedo).asarray(self.albedo[:, :, 0])
             # TODO: Add support for diffuse and direct albedos,
             # other values for ialbflg abnf the rest of the sfc parameterization code
         set_sfcemis(
@@ -641,7 +644,7 @@ class RTE_RRTMGPDriver:
             self._sfcemis_map,
             sfc_state.sfcemis.field,
         )
-        state.sfc_emis.view[:] = self.sfcemis
+        state.sfc_emis.view[:] = array_module(state.sfc_emis).asarray(self.sfcemis)
 
     def _update_inputs_if_needed(
         self, state: RTE_RRTMGPState, sdate: datetime.datetime

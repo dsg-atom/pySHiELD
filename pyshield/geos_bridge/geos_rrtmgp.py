@@ -38,6 +38,7 @@ from ndsl.dsl.typing import Float
 
 from pyshield.constants import P_REF
 from pyshield.radiation._config import RTE_RRTMGPConfig
+from pyshield.radiation._device import array_module
 from pyshield.radiation.rte_rrtmgp import RTE_RRTMGPDriver
 from pyshield.radiation.state import RTE_RRTMGPState
 from pyshield.stencils.surface import SurfaceState
@@ -94,8 +95,11 @@ class GEOSRRTMGP:
         # gridlon.view[:], gridlat.view[:], which is the (nx, ny) compute tile).
         self._gridlon = self.quantity_factory.zeros([I_DIM, J_DIM], "radians", dtype=Float)
         self._gridlat = self.quantity_factory.zeros([I_DIM, J_DIM], "radians", dtype=Float)
-        self._gridlon.view[:] = np.asarray(lons, dtype=Float).reshape(nx, ny)
-        self._gridlat.view[:] = np.asarray(lats, dtype=Float).reshape(nx, ny)
+        # On a GPU backend the Quantity views are cupy arrays; move the host
+        # lon/lat onto the device before filling (xp is numpy on CPU, a no-op).
+        _xp = array_module(self._gridlon)
+        self._gridlon.view[:] = _xp.asarray(np.asarray(lons, dtype=Float).reshape(nx, ny))
+        self._gridlat.view[:] = _xp.asarray(np.asarray(lats, dtype=Float).reshape(nx, ny))
 
         self._driver = RTE_RRTMGPDriver(
             config=config,
