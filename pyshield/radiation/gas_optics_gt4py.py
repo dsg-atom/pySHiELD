@@ -183,6 +183,27 @@ class GasOpticsGT4Py:
             self._temp_ref_min = tmin
             self._totplnk_delta = (tmax - tmin) / (self._nplancktemp - 1)
 
+        # Move the coefficient tables onto the backend device once. They are
+        # passed as fields into the GT4Py stencils, which on a GPU backend require
+        # device (cupy) arrays -- a host numpy array raises "no
+        # __cuda_array_interface__". A probe Quantity reveals the backend's array
+        # module (numpy on CPU, so this is a no-op there). kmajor + the minor kmin
+        # tables are used by both SW and LW; krayl is SW-only, pfracin/totplnk LW.
+        _xp = array_module(self._ff(self._qf))
+        if _xp is not np:
+            self._kmajor = _xp.asarray(self._kmajor)
+            for _suffix in self._minor_tabs:
+                self._minor_tabs[_suffix]["kmin"] = _xp.asarray(
+                    self._minor_tabs[_suffix]["kmin"]
+                )
+            if self.is_sw:
+                self._krayl = {
+                    _b: _xp.asarray(_k) for _b, _k in self._krayl.items()
+                }
+            else:
+                self._pfracin = _xp.asarray(self._pfracin)
+                self._totplnk = _xp.asarray(self._totplnk)
+
     # ------------------------------------------------------------------ utils
     def _idx_of(self, name):
         """0-based index into `_selected_gas_names_ext` for a minor/scaling gas.

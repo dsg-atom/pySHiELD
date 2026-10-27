@@ -119,6 +119,19 @@ class CloudOpticsGT4Py:
             domain=gi.domain_compute(),
         )
 
+        # Move the LUT coefficient tables onto the backend device once (they are
+        # passed as fields into the cloud_lut_band stencil; a GPU backend needs
+        # device/cupy arrays, a host numpy array raises "no
+        # __cuda_array_interface__"). numpy on CPU -> no-op.
+        _xp = array_module(self._ff())
+        if _xp is not np:
+            self._ext_liq = _xp.asarray(self._ext_liq)
+            self._ssa_liq = _xp.asarray(self._ssa_liq)
+            self._asy_liq = _xp.asarray(self._asy_liq)
+            self._ext_ice = _xp.asarray(self._ext_ice)
+            self._ssa_ice = _xp.asarray(self._ssa_ice)
+            self._asy_ice = _xp.asarray(self._asy_ice)
+
     # --------------------------------------------------------- table loading
     def _coeff_dataset(self):
         """The raw cloud-coefficient dataset pyRTE loaded (like GasOptics)."""
