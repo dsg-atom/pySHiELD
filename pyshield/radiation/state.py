@@ -354,30 +354,14 @@ class RTE_RRTMGPState:
                 if field_info.metadata["intent"] != "out":
                     if issubclass(field_info.type, Quantity):  # type: ignore[arg-type]
                         dims = []
-                        slice_list = []
                         ndims = len(field_info.metadata["dims"])
                         nz = self._nz
                         for dim_name in field_info.metadata["dims"]:
-                            # dims.append(f"{dim_name}_{name}")
                             if dim_name == K_INTERFACE_DIM:
-                                slice_list.append(
-                                    np.s_[:]  # type: ignore[attr-defined]
-                                )
                                 nz = self._nz + 1
                                 dims.append("level")
                             elif dim_name == K_DIM:
-                                slice_list.append(
-                                    np.s_[:-1]  # type: ignore[attr-defined]
-                                )
                                 dims.append("layer")
-                            elif "INTERFACE" in dim_name:
-                                slice_list.append(
-                                    np.s_[3:-3]  # type: ignore[attr-defined]
-                                )
-                            else:
-                                slice_list.append(
-                                    np.s_[3:-4]  # type: ignore[attr-defined]
-                                )
                         # We have to reshape to get the max 2D shape rterrtmgp expects:
                         if ndims == 3:  # x-y-z array:
                             newshape = (-1, nz)
@@ -391,13 +375,22 @@ class RTE_RRTMGPState:
                             raise NotImplementedError(
                                 (
                                     "RadiationShape doesn't support more than 3D "
-                                    f"arrays, {dim_name} has {ndims} axes"
+                                    f"arrays, {name} has {ndims} axes"
                                 )
                             )
+                        # Use the compute-domain VIEW -- exactly (nx,ny,nz) or
+                        # (nx,ny,nz+1) on BOTH the CPU and GPU backends -- instead of
+                        # the full data domain with fixed halo strips. gt4py's CPU
+                        # storage pads the data domain (nx+2*nhalo+1, K=nz+1), so the
+                        # old np.s_[3:-4] / [:-1] strips happened to recover the
+                        # compute window; DaCe's GPU storage has no such padding, so
+                        # those fixed strips over-stripped by one in every axis
+                        # (the 352440 vs 45*90*91 reshape mismatch). The view is
+                        # backend-agnostic; gt_utils.asarray brings cupy -> host.
                         data_vars[name] = xr.DataArray(
-                            gt_utils.asarray(getattr(self, name)[:])[
-                                tuple(slice_list)
-                            ].reshape(newshape),
+                            gt_utils.asarray(
+                                getattr(self, name).view[:]
+                            ).reshape(newshape),
                             dims=dims,
                             attrs={
                                 "long_name": field_info.metadata["name"],
