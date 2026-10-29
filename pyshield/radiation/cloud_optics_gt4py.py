@@ -69,6 +69,14 @@ class CloudOpticsGT4Py:
         self._backend = backend
         self._icergh = int(ice_roughness)
 
+        # Data residency (default OFF; the driver turns it ON). When ON, compute()
+        # keeps the by-band cloud optics on the backend device in `device_tiles`
+        # and add_to() folds them into the gas optics' device tiles in place, so
+        # the all-sky optics never leave the device between gas optics and the
+        # solver. See GasOpticsGT4Py for the matching flag.
+        self._resident = False
+        self.device_tiles = None
+
         ds = self._coeff_dataset()
 
         # dims (fall back to common alternate names if pyRTE renamed them).
@@ -282,6 +290,9 @@ class CloudOpticsGT4Py:
         ncol = int(np.prod([base.sizes[d] for d in noncore]))
         assert ncol == self.nx * self.ny, (ncol, self.nx, self.ny)
 
+        # Reset per call; populated below only on the resident path.
+        self.device_tiles = None
+
         # 2. cloud inputs (upcast to float64 to match the Fortran bytes).
         m = atmosphere.mapping
         xp = self._xp
@@ -307,13 +318,19 @@ class CloudOpticsGT4Py:
             taussag = ltaussag + itaussag
             ssa = taussa / xp.maximum(EPS, tau)
             g = taussag / xp.maximum(EPS, taussa)
-            self._write(base, "tau", tau, [layer_dim, spec_dim])
-            self._write(base, "ssa", ssa, [layer_dim, spec_dim])
-            self._write(base, "g", g, [layer_dim, spec_dim])
+            if self._resident:
+                self.device_tiles = {"tau": tau, "ssa": ssa, "g": g}
+            else:
+                self._write(base, "tau", tau, [layer_dim, spec_dim])
+                self._write(base, "ssa", ssa, [layer_dim, spec_dim])
+                self._write(base, "g", g, [layer_dim, spec_dim])
         else:
             # ABSORPTION (1scl): tau = (ltau-ltaussa) + (itau-itaussa).
             tau = (ltau - ltaussa) + (itau - itaussa)
-            self._write(base, "tau", tau, [layer_dim, spec_dim])
+            if self._resident:
+                self.device_tiles = {"tau": tau}
+            else:
+                self._write(base, "tau", tau, [layer_dim, spec_dim])
 
         return base
 
@@ -366,7 +383,7 @@ class CloudOpticsGT4Py:
             gpt2band[s0:e0] = b
         return gpt2band
 
-    def add_to(self, gas_optics, cloud_output, gpt2band):
+    def add_to(self, gas_optics, cloud_output, gpt2band, gas_tiles=None):
         """Fold the by-band cloud optics into the by-g-point gas optics in place.
 
         `cloud_output` is the dataset returned by `compute` (by band);
@@ -375,6 +392,13 @@ class CloudOpticsGT4Py:
         (`gpt2band_from_limits(gas_optics_file bnd_limits_gpt)`). The gas-optics
         dataset is overwritten in place (TWO_STREAM: tau/ssa/g; ABSORPTION:
         tau), reproducing `cloud_props.rte.add_to(gas_optics)`.
+
+        Residency: when `gas_tiles` (the gas optics' `device_tiles` dict) is
+        passed, the combine runs entirely on the backend device -- the cloud
+        optics come from `self.device_tiles` (set by `compute`) and the result is
+        written back into `gas_tiles` in place, so the solver reads the combined
+        optics on-device with no host round-trip. `gas_optics` (the container) is
+        still used for its structural metadata (dims, sizes, gpt order).
         """
         nx, ny, nz = self.nx, self.ny, self.nz
         gpt2band = np.asarray(gpt2band, dtype=np.int64)
@@ -384,20 +408,31 @@ class CloudOpticsGT4Py:
         ngpt = int(gas_optics.sizes[gspec])
         assert gpt2band.shape == (ngpt,), (gpt2band.shape, ngpt)
 
-        # Tile cloud (by band) AND gas (by g-point) with the SAME non-core column
-        # ordering so the (nx, ny) fold aligns column-for-column between them.
-        save_noncore = self._noncore
-        self._noncore = gnoncore  # _tile reads self._noncore
-        # Tile to host (from the pyRTE xarrays) then move onto the backend device
-        # so the per-g-point slicing + the stencil increments run device->device.
+        resident = gas_tiles is not None
         xp = self._xp
-        ctau = xp.asarray(self._tile(cloud_output["tau"], [self._layer_dim, self._spec_dim]))
-        gtau = xp.asarray(self._tile(gas_optics["tau"], [glayer, gspec]))
-        if self._is_2str:
-            cssa = xp.asarray(self._tile(cloud_output["ssa"], [self._layer_dim, self._spec_dim]))
-            cg = xp.asarray(self._tile(cloud_output["g"], [self._layer_dim, self._spec_dim]))
-            gssa = xp.asarray(self._tile(gas_optics["ssa"], [glayer, gspec]))
-            gg = xp.asarray(self._tile(gas_optics["g"], [glayer, gspec]))
+        if resident:
+            # Both operands already on-device, in the (nx, ny, nz, *) tile the
+            # per-g-point loop below indexes. gas_tiles is mutated in place.
+            ctau = self.device_tiles["tau"]
+            gtau = gas_tiles["tau"]
+            if self._is_2str:
+                cssa, cg = self.device_tiles["ssa"], self.device_tiles["g"]
+                gssa, gg = gas_tiles["ssa"], gas_tiles["g"]
+            assert gtau.shape == (nx, ny, nz, ngpt), (gtau.shape, (nx, ny, nz, ngpt))
+        else:
+            # Tile cloud (by band) AND gas (by g-point) with the SAME non-core
+            # column ordering so the (nx, ny) fold aligns column-for-column.
+            save_noncore = self._noncore
+            self._noncore = gnoncore  # _tile reads self._noncore
+            # Tile to host (from the pyRTE xarrays) then move onto the backend
+            # device so the slicing + stencil increments run device->device.
+            ctau = xp.asarray(self._tile(cloud_output["tau"], [self._layer_dim, self._spec_dim]))
+            gtau = xp.asarray(self._tile(gas_optics["tau"], [glayer, gspec]))
+            if self._is_2str:
+                cssa = xp.asarray(self._tile(cloud_output["ssa"], [self._layer_dim, self._spec_dim]))
+                cg = xp.asarray(self._tile(cloud_output["g"], [self._layer_dim, self._spec_dim]))
+                gssa = xp.asarray(self._tile(gas_optics["ssa"], [glayer, gspec]))
+                gg = xp.asarray(self._tile(gas_optics["g"], [glayer, gspec]))
 
         # per-g-point increment around the compile-once stencil.
         t1_q, t2_q = self._ff(), self._ff()
@@ -423,6 +458,15 @@ class CloudOpticsGT4Py:
             else:
                 self._inc1(tau1=t1_q, tau2=t2_q)
                 gtau[:, :, :, gpt] = t1_q.view[:]
+
+        if resident:
+            # gtau/gssa/gg ARE the gas_tiles arrays; the loop mutated them in
+            # place, so the combined optics are already where the solver reads.
+            gas_tiles["tau"] = gtau
+            if self._is_2str:
+                gas_tiles["ssa"] = gssa
+                gas_tiles["g"] = gg
+            return gas_tiles
 
         # write combined optics back into the gas-optics dataset in place.
         self._write(gas_optics, "tau", gtau, [glayer, gspec])

@@ -369,6 +369,14 @@ class RTE_RRTMGPDriver:
             self._band_limits_gpt(self._gas_optics_lw)
         )
 
+        # Keep the big optics (tau/ssa/g, LW Planck layer/level sources) on the
+        # backend device from gas optics through cloud add_to into the solver,
+        # instead of round-tripping them to the host pyRTE container and back.
+        # Numerically identical to the host path (it is the same arrays, not
+        # recomputed); it removes the PCIe copies that dominate the GPU cost.
+        # Toggleable so a test can compare resident vs host bit-for-bit.
+        self.set_radiation_residency(True)
+
         # Clear-sky RTE solvers: validated GT4Py ports (drop-in for the
         # clear-sky half of pyRTE's rte.solve). Built once here, mirroring the
         # GasOpticsGT4Py construction above (same nx, ny, nz and backend).
@@ -748,7 +756,25 @@ class RTE_RRTMGPDriver:
         self._assign_constant_gases(radx)
         return radx
 
-    def _solve_sw_clear(self, sw_optics):
+    def set_radiation_residency(self, on):
+        """Turn device residency on/off for all four gas/cloud instances.
+
+        ON keeps the big optics on the backend device from gas optics through
+        cloud add_to into the solver (no host round-trip). OFF restores the
+        host-container path. step_radiation reads `device_tiles` (populated only
+        when ON) and routes the solver and cloud add_to accordingly, so this one
+        switch selects the whole path. Used by the driver (ON by default) and by
+        the resident-vs-host equivalence test.
+        """
+        self._resident = bool(on)
+        for inst in (
+            self._gas_optics_sw, self._gas_optics_lw,
+            self._cloud_optics_sw, self._cloud_optics_lw,
+        ):
+            inst._resident = bool(on)
+            inst.device_tiles = None
+
+    def _solve_sw_clear(self, sw_optics, tiles=None):
         """Clear-sky shortwave broadband fluxes via the GT4Py two-stream solver.
 
         Extracts tau/ssa/g/mu0/surface_albedo/toa_source from the gas-optics
@@ -770,9 +796,15 @@ class RTE_RRTMGPDriver:
         ]
         ngpt = int(sw_optics.sizes["gpt"])
 
-        tau = _tile(sw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
-        ssa = _tile(sw_optics["ssa"], noncore, [layer_dim, "gpt"], nx, ny)
-        gg = _tile(sw_optics["g"], noncore, [layer_dim, "gpt"], nx, ny)
+        if tiles is not None:
+            # Resident: the solver reads tau/ssa/g straight off the device, in
+            # the (nx, ny, layer, gpt) tile gas optics (and cloud add_to) left
+            # them -- no host fold, no re-upload.
+            tau, ssa, gg = tiles["tau"], tiles["ssa"], tiles["g"]
+        else:
+            tau = _tile(sw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
+            ssa = _tile(sw_optics["ssa"], noncore, [layer_dim, "gpt"], nx, ny)
+            gg = _tile(sw_optics["g"], noncore, [layer_dim, "gpt"], nx, ny)
 
         # toa_source follows total_solar_irradiance's dims and may lack some
         # non-core dims; broadcast it over the full non-core set before tiling,
@@ -797,7 +829,7 @@ class RTE_RRTMGPDriver:
             inc_flux_dir=inc_dir,
         )
 
-    def _solve_sw_allsky(self, sw_optics):
+    def _solve_sw_allsky(self, sw_optics, tiles=None):
         """All-sky shortwave broadband fluxes via the GT4Py two-stream solver.
 
         Identical extraction and solver call to `_solve_sw_clear`, but invoked
@@ -821,9 +853,15 @@ class RTE_RRTMGPDriver:
         ]
         ngpt = int(sw_optics.sizes["gpt"])
 
-        tau = _tile(sw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
-        ssa = _tile(sw_optics["ssa"], noncore, [layer_dim, "gpt"], nx, ny)
-        gg = _tile(sw_optics["g"], noncore, [layer_dim, "gpt"], nx, ny)
+        if tiles is not None:
+            # Resident: the solver reads tau/ssa/g straight off the device, in
+            # the (nx, ny, layer, gpt) tile gas optics (and cloud add_to) left
+            # them -- no host fold, no re-upload.
+            tau, ssa, gg = tiles["tau"], tiles["ssa"], tiles["g"]
+        else:
+            tau = _tile(sw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
+            ssa = _tile(sw_optics["ssa"], noncore, [layer_dim, "gpt"], nx, ny)
+            gg = _tile(sw_optics["g"], noncore, [layer_dim, "gpt"], nx, ny)
 
         # toa_source follows total_solar_irradiance's dims and may lack some
         # non-core dims; broadcast it over the full non-core set before tiling,
@@ -848,7 +886,7 @@ class RTE_RRTMGPDriver:
             inc_flux_dir=inc_dir,
         )
 
-    def _solve_lw_clear(self, lw_optics):
+    def _solve_lw_clear(self, lw_optics, tiles=None):
         """Clear-sky longwave broadband fluxes via the GT4Py no-scattering solver.
 
         Extracts tau and the Planck sources (layer/level/surface) plus the
@@ -871,9 +909,17 @@ class RTE_RRTMGPDriver:
         ]
         ngpt = int(lw_optics.sizes["gpt"])
 
-        tau = _tile(lw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
-        lay = _tile(lw_optics["layer_source"], noncore, [layer_dim, "gpt"], nx, ny)
-        lev = _tile(lw_optics["level_source"], noncore, [level_dim, "gpt"], nx, ny)
+        if tiles is not None:
+            # Resident: tau and the layer/level Planck sources come straight off
+            # the device (cloud add_to incremented tau in place for all-sky).
+            # surface_source has no layer axis -- it stays in the container.
+            tau = tiles["tau"]
+            lay = tiles["layer_source"]
+            lev = tiles["level_source"]
+        else:
+            tau = _tile(lw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
+            lay = _tile(lw_optics["layer_source"], noncore, [layer_dim, "gpt"], nx, ny)
+            lev = _tile(lw_optics["level_source"], noncore, [level_dim, "gpt"], nx, ny)
         sfc = _tile(lw_optics["surface_source"], noncore, ["gpt"], nx, ny)
 
         # Surface emissivity here is a single per-column value (radx["sfc_emis"],
@@ -894,7 +940,7 @@ class RTE_RRTMGPDriver:
             sfc_emis=emis,
         )
 
-    def _solve_lw_allsky(self, lw_optics):
+    def _solve_lw_allsky(self, lw_optics, tiles=None):
         """All-sky longwave broadband fluxes via the GT4Py no-scattering solver.
 
         Identical extraction and solver call to `_solve_lw_clear`, but invoked
@@ -924,9 +970,17 @@ class RTE_RRTMGPDriver:
 
         # tau is the COMBINED gas+cloud absorption tau (add_to mutated it in
         # place); the Planck sources are unchanged from the clear-sky solve.
-        tau = _tile(lw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
-        lay = _tile(lw_optics["layer_source"], noncore, [layer_dim, "gpt"], nx, ny)
-        lev = _tile(lw_optics["level_source"], noncore, [level_dim, "gpt"], nx, ny)
+        if tiles is not None:
+            # Resident: tau and the layer/level Planck sources come straight off
+            # the device (cloud add_to incremented tau in place for all-sky).
+            # surface_source has no layer axis -- it stays in the container.
+            tau = tiles["tau"]
+            lay = tiles["layer_source"]
+            lev = tiles["level_source"]
+        else:
+            tau = _tile(lw_optics["tau"], noncore, [layer_dim, "gpt"], nx, ny)
+            lay = _tile(lw_optics["layer_source"], noncore, [layer_dim, "gpt"], nx, ny)
+            lev = _tile(lw_optics["level_source"], noncore, [level_dim, "gpt"], nx, ny)
         sfc = _tile(lw_optics["surface_source"], noncore, ["gpt"], nx, ny)
 
         emis_da = lw_optics["surface_emissivity"]
@@ -975,7 +1029,8 @@ class RTE_RRTMGPDriver:
         # Clear-sky SW solve: validated GT4Py two-stream solver (replaces the
         # pyRTE sw_optics.rte.solve for the clear-sky path only). Input
         # extraction mirrors tests/rte_solver/test_sw_solver_gt4py.py.
-        bb_up_sw, bb_dn_sw, _bb_dir_sw = self._solve_sw_clear(sw_optics)
+        sw_tiles = self._gas_optics_sw.device_tiles  # None unless resident
+        bb_up_sw, bb_dn_sw, _bb_dir_sw = self._solve_sw_clear(sw_optics, sw_tiles)
         state.fswd_clr.view[:] = bb_dn_sw.reshape(state.fswd_clr.view[:].shape)
         state.fswu_clr.view[:] = bb_up_sw.reshape(state.fswu_clr.view[:].shape)
 
@@ -991,14 +1046,16 @@ class RTE_RRTMGPDriver:
         # the clear-sky solve above has read the gas-only optics, so it does not
         # retroactively change the clear-sky result.
         self._cloud_optics_sw.add_to(
-            sw_optics, sw_cloud_optical_props, self._gpt2band_sw
+            sw_optics, sw_cloud_optical_props, self._gpt2band_sw, gas_tiles=sw_tiles
         )
         # All-sky SW solve: the SAME validated GT4Py two-stream solver, now fed
         # the COMBINED gas+cloud optics (add_to above mutated sw_optics in place,
         # so tau/ssa/g carry real cloud asymmetry g != 0). Validated on g != 0 by
         # tests/rte_solver/test_sw_solver_allsky_gt4py.py. Replaces the former
         # pyRTE sw_optics.rte.solve(add_to_input=False).
-        bb_up_sw_all, bb_dn_sw_all, _bb_dir_sw_all = self._solve_sw_allsky(sw_optics)
+        bb_up_sw_all, bb_dn_sw_all, _bb_dir_sw_all = self._solve_sw_allsky(
+            sw_optics, sw_tiles
+        )
         state.fswd.view[:] = bb_dn_sw_all.reshape(state.fswd.view[:].shape)
         state.fswu.view[:] = bb_up_sw_all.reshape(state.fswu.view[:].shape)
 
@@ -1014,7 +1071,8 @@ class RTE_RRTMGPDriver:
         # Clear-sky LW solve: validated GT4Py no-scattering solver (replaces the
         # pyRTE lw_optics.rte.solve for the clear-sky path only). Input
         # extraction mirrors tests/rte_solver/test_lw_solver_gt4py.py.
-        bb_up_lw, bb_dn_lw = self._solve_lw_clear(lw_optics)
+        lw_tiles = self._gas_optics_lw.device_tiles  # None unless resident
+        bb_up_lw, bb_dn_lw = self._solve_lw_clear(lw_optics, lw_tiles)
         state.flwd_clr.view[:] = bb_dn_lw.reshape(state.flwd_clr.view[:].shape)
         state.flwu_clr.view[:] = bb_up_lw.reshape(state.flwu_clr.view[:].shape)
         lw_cloud_optical_props = self._cloud_optics_lw.compute(
@@ -1029,7 +1087,7 @@ class RTE_RRTMGPDriver:
         # the clear-sky solve above has read the gas-only optics, so it does not
         # retroactively change the clear-sky result.
         self._cloud_optics_lw.add_to(
-            lw_optics, lw_cloud_optical_props, self._gpt2band_lw
+            lw_optics, lw_cloud_optical_props, self._gpt2band_lw, gas_tiles=lw_tiles
         )
         # All-sky LW solve: the SAME validated GT4Py no-scattering solver, now fed
         # the COMBINED gas+cloud absorption tau (add_to above mutated lw_optics in
@@ -1038,7 +1096,7 @@ class RTE_RRTMGPDriver:
         # rescaling, NO new solver needed. Validated by
         # tests/rte_solver/test_lw_solver_allsky_gt4py.py. Replaces the former
         # pyRTE lw_optics.rte.solve(add_to_input=False).
-        bb_up_lw_all, bb_dn_lw_all = self._solve_lw_allsky(lw_optics)
+        bb_up_lw_all, bb_dn_lw_all = self._solve_lw_allsky(lw_optics, lw_tiles)
         state.flwd.view[:] = bb_dn_lw_all.reshape(state.flwd.view[:].shape)
         state.flwu.view[:] = bb_up_lw_all.reshape(state.flwu.view[:].shape)
 

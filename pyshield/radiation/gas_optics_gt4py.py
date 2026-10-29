@@ -80,6 +80,18 @@ class GasOpticsGT4Py:
         self.nx, self.ny, self.nz = int(nx), int(ny), int(nz)
         self._backend = backend
 
+        # Data residency (default OFF -> byte-identical to the host path; the
+        # driver turns it ON for its own instances). When ON, compute() keeps the
+        # big (nx, ny, layer, gpt) optics on the backend device in `device_tiles`
+        # and SKIPS writing them back to the host pyRTE container, so the solver
+        # and cloud add_to can read them on-device with no host round-trip. The
+        # small per-column / no-layer vars (toa_source, surface_source, jacobian)
+        # still go through the container; they are cheap and keep the plumbing
+        # unchanged. Standalone class tests construct this object directly, leave
+        # the flag off, and still get the full container they compare to pyRTE.
+        self._resident = False
+        self.device_tiles = None
+
         ds = self._pyrte._dataset
         self.ngpt = int(ds.sizes["gpt"])
 
@@ -375,6 +387,9 @@ class GasOpticsGT4Py:
         ncol = int(np.prod([base.sizes[d] for d in self._noncore]))
         assert ncol == self.nx * self.ny, (ncol, self.nx, self.ny)
 
+        # Reset per call; populated below only on the resident path.
+        self.device_tiles = None
+
         tau_abs = self._tau_absorption(atmosphere, interp)
 
         if self.is_sw:
@@ -383,16 +398,29 @@ class GasOpticsGT4Py:
             tiny = 2.0 * np.finfo(np.float64).tiny
             ssa = self._xp.where(tau > tiny, tau_rayl / tau, 0.0)
             g = self._xp.zeros_like(tau)
-            self._write(base, "tau", tau, [layer_dim, "gpt"])
-            self._write(base, "ssa", ssa, [layer_dim, "gpt"])
-            self._write(base, "g", g, [layer_dim, "gpt"])
+            if self._resident:
+                # Keep the big optics on-device; the solver and cloud add_to read
+                # them from here. Skip the host write-back for these three.
+                self.device_tiles = {"tau": tau, "ssa": ssa, "g": g}
+            else:
+                self._write(base, "tau", tau, [layer_dim, "gpt"])
+                self._write(base, "ssa", ssa, [layer_dim, "gpt"])
+                self._write(base, "g", g, [layer_dim, "gpt"])
             self._toa_source(atmosphere, base)
         else:
-            self._write(base, "tau", tau_abs, [layer_dim, "gpt"])
             sfc, lay, lev, jac = self._planck(atmosphere, interp, base)
+            if self._resident:
+                self.device_tiles = {
+                    "tau": tau_abs, "layer_source": lay, "level_source": lev,
+                }
+            else:
+                self._write(base, "tau", tau_abs, [layer_dim, "gpt"])
+                self._write(base, "layer_source", lay, [layer_dim, "gpt"])
+                self._write(base, "level_source", lev, [level_dim, "gpt"])
+            # surface_source + jacobian have no layer axis (cheap); always route
+            # them through the container -- the LW solve reads surface_source from
+            # it, and the jacobian is kept there for downstream use.
             self._write(base, "surface_source", sfc, ["gpt"])
-            self._write(base, "layer_source", lay, [layer_dim, "gpt"])
-            self._write(base, "level_source", lev, [level_dim, "gpt"])
             self._write(base, "surface_source_jacobian", jac, ["gpt"])
 
         return base
