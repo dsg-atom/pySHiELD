@@ -97,8 +97,10 @@ def main():
     print("=== radiation functions by cumulative time (one call) ===")
     st = pstats.Stats(pr).sort_stats("cumulative")
     st.print_stats("pyshield", 30)
-    print("=== top by total (self) time ===")
+    print("=== top by total (self) time, radiation code ===")
     pstats.Stats(pr).sort_stats("tottime").print_stats("pyshield", 20)
+    print("=== top overall by self time (incl cupy/numpy/gt4py internals) ===")
+    pstats.Stats(pr).sort_stats("tottime").print_stats(30)
 
     geos_rrtmgp.geos_rrtmgp_finalize()
 
