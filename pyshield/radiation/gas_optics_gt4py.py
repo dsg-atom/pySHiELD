@@ -334,17 +334,34 @@ class GasOpticsGT4Py:
         variable_mapping=None,
         add_to_input=False,
     ):
-        # 1. pyRTE builds the structured output (and, as a side effect, sets
-        #    self._pyrte._gas_names, atmosphere.mapping, and top_at_1).
-        base = self._pyrte.compute(
-            atmosphere,
-            problem_type=problem_type,
-            add_to_input=add_to_input,
-            gas_name_map=gas_name_map,
-            variable_mapping=variable_mapping,
-        )
+        # The output container (dims/coords/mapping/top_at_1) is grid-fixed, and
+        # we overwrite every per-step field (tau/ssa/g and the sources) ourselves,
+        # so pyRTE only needs to build it ONCE. pyRTE.compute() otherwise runs its
+        # whole Fortran gas optics -- tau_absorption + Planck/rayleigh -- every
+        # step only for the result to be discarded here. First call: run the full
+        # compute (it also sets self._pyrte._gas_names and the dataset mapping) and
+        # cache the container. Later calls: skip it, replicate only the cheap
+        # mapping side-effect (which lives in atmosphere.attrs["dataset_mapping"],
+        # where interpolate reads it), and reuse the container structure.
+        if getattr(self, "_base_template", None) is None:
+            base = self._pyrte.compute(
+                atmosphere,
+                problem_type=problem_type,
+                add_to_input=add_to_input,
+                gas_name_map=gas_name_map,
+                variable_mapping=variable_mapping,
+            )
+            self._base_template = base.copy(deep=True)
+            self._mapping_attr = atmosphere.attrs.get("dataset_mapping")
+            self._top_at_1 = base.attrs.get("top_at_1")
+        else:
+            atmosphere.attrs["dataset_mapping"] = self._mapping_attr
+            # shallow copy: _write/_toa_source reassign vars (no in-place mutation),
+            # so the template stays pristine and the per-step cost is tiny.
+            base = self._base_template.copy()
+            base.attrs["top_at_1"] = self._top_at_1
 
-        # 2. interpolation intermediates (re-run; overwrite-first accepts this).
+        # interpolation intermediates -- the one pyRTE call we need each step.
         gas_mapping = self._gas_mapping(atmosphere, gas_name_map)
         interp = self._pyrte.interpolate(atmosphere, gas_mapping)
 

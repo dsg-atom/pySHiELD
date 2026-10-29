@@ -174,3 +174,47 @@ def test_gas_optics_gt4py_lw():
     assert np.all(mine["tau"].values >= 0.0)
     assert np.any(mine["layer_source"].values > 0.0)
     assert np.any(mine["surface_source"].values > 0.0)
+
+
+def test_gas_optics_gt4py_container_reuse():
+    """compute() builds the pyRTE output container once and reuses it on later
+    calls (skipping the discarded pyRTE Fortran gas optics). A 2nd call on a
+    DIFFERENT atmosphere must match a fresh instance computing that atmosphere:
+    this proves the reuse path recomputes tau/sources for the new state and only
+    reuses the empty container shell -- not that it returns stale cached values.
+    """
+    env = _rfmip()
+    gm, rte = env["gm"], env["rte"]
+    file = env["GasOpticsFiles"].LW_G256
+    from pyrte_rrtmgp.examples import RFMIP_FILES, load_example_file
+
+    atm1 = load_example_file(RFMIP_FILES.ATMOSPHERE).isel(site=SITES, expt=EXPTS)
+    # a different experiment subset -> same (4, 4) shape, different state.
+    atm2 = load_example_file(RFMIP_FILES.ATMOSPHERE).isel(site=SITES, expt=[1, 7, 13, 16])
+    nz = _nz(atm1, env["make_mapping"])
+    mk = env["make_mapping"]
+
+    def run(go, atm):
+        return go.compute(
+            atm.copy(deep=True), problem_type=rte.OpticsTypes.ABSORPTION,
+            gas_name_map=gm, variable_mapping=mk(), add_to_input=False,
+        )
+
+    go = GasOpticsGT4Py(
+        gas_optics_file=file, nx=len(SITES), ny=len(EXPTS), nz=nz, backend=backend_python
+    )
+    run(go, atm1)             # first call: builds + caches the container template
+    reuse = run(go, atm2)     # reuse path: cached container, recomputed for atm2
+
+    fresh = GasOpticsGT4Py(
+        gas_optics_file=file, nx=len(SITES), ny=len(EXPTS), nz=nz, backend=backend_python
+    )
+    ref = run(fresh, atm2)    # first-call path on atm2 (full pyRTE container)
+
+    # same GT4Py computation + inputs -> identical to numerical roundoff.
+    for var in ("tau", "surface_source", "layer_source", "level_source",
+                "surface_source_jacobian"):
+        np.testing.assert_allclose(
+            reuse[var].values, ref[var].transpose(*reuse[var].dims).values,
+            rtol=1e-13, atol=0.0, err_msg=f"reuse vs fresh: {var}",
+        )
