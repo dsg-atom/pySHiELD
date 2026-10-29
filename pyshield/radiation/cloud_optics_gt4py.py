@@ -123,7 +123,8 @@ class CloudOpticsGT4Py:
         # passed as fields into the cloud_lut_band stencil; a GPU backend needs
         # device/cupy arrays, a host numpy array raises "no
         # __cuda_array_interface__"). numpy on CPU -> no-op.
-        _xp = array_module(self._ff())
+        self._xp = array_module(self._ff())
+        _xp = self._xp
         if _xp is not np:
             self._ext_liq = _xp.asarray(self._ext_liq)
             self._ssa_liq = _xp.asarray(self._ssa_liq)
@@ -217,6 +218,9 @@ class CloudOpticsGT4Py:
 
     def _write(self, base, var, result, core_dims):
         """Overwrite base[var] (dims = non-core + core_dims) with `result`."""
+        # The compute path runs on the backend device; cross to host here, the
+        # one place results re-enter the pyRTE xarray dataset.
+        result = to_host(result)
         da = base[var]
         b = da.transpose(*self._noncore, *core_dims)
         core_shape = result.shape[2:]
@@ -231,9 +235,10 @@ class CloudOpticsGT4Py:
         the Fortran `min(..., nsteps-1)`, the lower clamp only touches no-cloud
         cells (re arbitrary there) whose tau is zeroed anyway by lwp = 0.
         """
+        xp = self._xp
         val = (re - offset) / step
-        idx0 = np.minimum(np.floor(val).astype(np.int64), nsteps - 2)
-        idx0 = np.clip(idx0, 0, nsteps - 2)
+        idx0 = xp.minimum(xp.floor(val).astype(np.int64), nsteps - 2)
+        idx0 = idx0.clip(0, nsteps - 2)
         fint = val - idx0
         return idx0.astype(np.int64), fint
 
@@ -279,10 +284,11 @@ class CloudOpticsGT4Py:
 
         # 2. cloud inputs (upcast to float64 to match the Fortran bytes).
         m = atmosphere.mapping
-        lwp = self._tile(atmosphere[m.get_var("lwp")], [layer_dim]).astype(np.float64)
-        iwp = self._tile(atmosphere[m.get_var("iwp")], [layer_dim]).astype(np.float64)
-        rel = self._tile(atmosphere[m.get_var("rel")], [layer_dim]).astype(np.float64)
-        rei = self._tile(atmosphere[m.get_var("rei")], [layer_dim]).astype(np.float64)
+        xp = self._xp
+        lwp = xp.asarray(self._tile(atmosphere[m.get_var("lwp")], [layer_dim]).astype(np.float64))
+        iwp = xp.asarray(self._tile(atmosphere[m.get_var("iwp")], [layer_dim]).astype(np.float64))
+        rel = xp.asarray(self._tile(atmosphere[m.get_var("rel")], [layer_dim]).astype(np.float64))
+        rei = xp.asarray(self._tile(atmosphere[m.get_var("rei")], [layer_dim]).astype(np.float64))
 
         # 3. per-band LUT lookup, liquid then ice.
         ltau, ltaussa, ltaussag = self._lut_phase(
@@ -299,8 +305,8 @@ class CloudOpticsGT4Py:
             tau = ltau + itau
             taussa = ltaussa + itaussa
             taussag = ltaussag + itaussag
-            ssa = taussa / np.maximum(EPS, tau)
-            g = taussag / np.maximum(EPS, taussa)
+            ssa = taussa / xp.maximum(EPS, tau)
+            g = taussag / xp.maximum(EPS, taussa)
             self._write(base, "tau", tau, [layer_dim, spec_dim])
             self._write(base, "ssa", ssa, [layer_dim, spec_dim])
             self._write(base, "g", g, [layer_dim, spec_dim])
@@ -319,16 +325,16 @@ class CloudOpticsGT4Py:
         lwp_q, fint_q = self._ff(), self._ff()
         idx_q, iband_q = self._fi(), self._fi()
         tau_q, taussa_q, taussag_q = self._ff(), self._ff(), self._ff()
-        # Inputs onto the backend device for the device Quantity views; results
-        # come back to host (the caller folds them into a pyRTE xarray dataset).
-        xp = array_module(lwp_q)
+        # Inputs and accumulators on the backend device; the per-band loop runs
+        # device->device and results cross to host only in _write.
+        xp = self._xp
         lwp_q.view[:] = xp.asarray(wp)
         fint_q.view[:] = xp.asarray(fint)
         idx_q.view[:] = xp.asarray(idx0)
 
-        tau = np.zeros((nx, ny, nz, nbnd), dtype=np.float64)
-        taussa = np.zeros((nx, ny, nz, nbnd), dtype=np.float64)
-        taussag = np.zeros((nx, ny, nz, nbnd), dtype=np.float64)
+        tau = xp.zeros((nx, ny, nz, nbnd), dtype=np.float64)
+        taussa = xp.zeros((nx, ny, nz, nbnd), dtype=np.float64)
+        taussag = xp.zeros((nx, ny, nz, nbnd), dtype=np.float64)
         for b in range(nbnd):
             iband_q.view[:] = b
             self._lut(
@@ -336,9 +342,9 @@ class CloudOpticsGT4Py:
                 ext=ext, ssa=ssa, asy=asy,
                 tau=tau_q, taussa=taussa_q, taussag=taussag_q,
             )
-            tau[:, :, :, b] = to_host(tau_q.view[:])
-            taussa[:, :, :, b] = to_host(taussa_q.view[:])
-            taussag[:, :, :, b] = to_host(taussag_q.view[:])
+            tau[:, :, :, b] = tau_q.view[:]
+            taussa[:, :, :, b] = taussa_q.view[:]
+            taussag[:, :, :, b] = taussag_q.view[:]
         return tau, taussa, taussag
 
     # ---------------------------------------------------------------- add_to
@@ -382,41 +388,41 @@ class CloudOpticsGT4Py:
         # ordering so the (nx, ny) fold aligns column-for-column between them.
         save_noncore = self._noncore
         self._noncore = gnoncore  # _tile reads self._noncore
-        ctau = self._tile(cloud_output["tau"], [self._layer_dim, self._spec_dim])
-        gtau = self._tile(gas_optics["tau"], [glayer, gspec])
+        # Tile to host (from the pyRTE xarrays) then move onto the backend device
+        # so the per-g-point slicing + the stencil increments run device->device.
+        xp = self._xp
+        ctau = xp.asarray(self._tile(cloud_output["tau"], [self._layer_dim, self._spec_dim]))
+        gtau = xp.asarray(self._tile(gas_optics["tau"], [glayer, gspec]))
         if self._is_2str:
-            cssa = self._tile(cloud_output["ssa"], [self._layer_dim, self._spec_dim])
-            cg = self._tile(cloud_output["g"], [self._layer_dim, self._spec_dim])
-            gssa = self._tile(gas_optics["ssa"], [glayer, gspec])
-            gg = self._tile(gas_optics["g"], [glayer, gspec])
+            cssa = xp.asarray(self._tile(cloud_output["ssa"], [self._layer_dim, self._spec_dim]))
+            cg = xp.asarray(self._tile(cloud_output["g"], [self._layer_dim, self._spec_dim]))
+            gssa = xp.asarray(self._tile(gas_optics["ssa"], [glayer, gspec]))
+            gg = xp.asarray(self._tile(gas_optics["g"], [glayer, gspec]))
 
         # per-g-point increment around the compile-once stencil.
         t1_q, t2_q = self._ff(), self._ff()
         if self._is_2str:
             s1_q, g1_q, s2_q, g2_q = self._ff(), self._ff(), self._ff(), self._ff()
 
-        # Inputs onto the backend device for the device Quantity views; results
-        # come back to host to be written into the pyRTE gas-optics dataset.
-        xp = array_module(t1_q)
         for gpt in range(ngpt):
             b = int(gpt2band[gpt])
-            t1_q.view[:] = xp.asarray(gtau[:, :, :, gpt])
-            t2_q.view[:] = xp.asarray(ctau[:, :, :, b])
+            t1_q.view[:] = gtau[:, :, :, gpt]
+            t2_q.view[:] = ctau[:, :, :, b]
             if self._is_2str:
-                s1_q.view[:] = xp.asarray(gssa[:, :, :, gpt])
-                g1_q.view[:] = xp.asarray(gg[:, :, :, gpt])
-                s2_q.view[:] = xp.asarray(cssa[:, :, :, b])
-                g2_q.view[:] = xp.asarray(cg[:, :, :, b])
+                s1_q.view[:] = gssa[:, :, :, gpt]
+                g1_q.view[:] = gg[:, :, :, gpt]
+                s2_q.view[:] = cssa[:, :, :, b]
+                g2_q.view[:] = cg[:, :, :, b]
                 self._inc2(
                     tau1=t1_q, ssa1=s1_q, g1=g1_q,
                     tau2=t2_q, ssa2=s2_q, g2=g2_q,
                 )
-                gtau[:, :, :, gpt] = to_host(t1_q.view[:])
-                gssa[:, :, :, gpt] = to_host(s1_q.view[:])
-                gg[:, :, :, gpt] = to_host(g1_q.view[:])
+                gtau[:, :, :, gpt] = t1_q.view[:]
+                gssa[:, :, :, gpt] = s1_q.view[:]
+                gg[:, :, :, gpt] = g1_q.view[:]
             else:
                 self._inc1(tau1=t1_q, tau2=t2_q)
-                gtau[:, :, :, gpt] = to_host(t1_q.view[:])
+                gtau[:, :, :, gpt] = t1_q.view[:]
 
         # write combined optics back into the gas-optics dataset in place.
         self._write(gas_optics, "tau", gtau, [glayer, gspec])
