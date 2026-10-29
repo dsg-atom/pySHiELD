@@ -65,6 +65,11 @@ _FMAJ_AXES = {
     "f112": (0, 0, 1), "f212": (1, 0, 1), "f122": (0, 1, 1), "f222": (1, 1, 1),
 }
 
+# g-points per chunk in the batched major-gas interpolation. Fewer chunks means
+# fewer kernel launches (the bottleneck) but more peak memory; 64 gives 4 chunks
+# for the 256-g-point longwave. Lower it for the tighter multi-rank GPU budget.
+_GPT_CHUNK = 64
+
 
 class GasOpticsGT4Py:
     """pyRTE `GasOptics` with the gather core replaced by GT4Py stencils."""
@@ -412,6 +417,49 @@ class GasOpticsGT4Py:
         iv["si"], iv["ei"], iv["li"] = xp.asarray(np.indices((nx, ny, nz)))
         return iv
 
+    def _major_batched(self, iv, table, unit_scaling=False):
+        """Major-gas 8-point interpolation over ALL g-points, in chunks.
+
+        Reproduces interp3d_major_1gpt for every g-point at once, replacing the
+        256-call stencil loop (whose cost was the launches, not the math) with a
+        few large vectorized gathers + arithmetic per chunk. `table` is kmajor
+        (absorption) or pfracin (the Planck fraction); `unit_scaling=True` sets
+        both col_mix brackets to 1, the Planck pfrac path. Returns (nx,ny,nz,ngpt).
+        """
+        xp = self._xp
+        nx, ny, nz, ngpt = self.nx, self.ny, self.nz, self.ngpt
+        gpf = self._gpoint_flavor
+        itropo = iv["itropo"][..., None]          # (nx,ny,nz,1)
+        si, ei, li = iv["si"][..., None], iv["ei"][..., None], iv["li"][..., None]
+        jt = iv["jtemp0"][..., None]              # lower temperature bracket
+        jp = iv["jpress0"][..., None]             # lower pressure bracket
+        cm0, cm1 = iv["col_mix"][:, :, 0], iv["col_mix"][:, :, 1]
+        fmajor = iv["fmajor"]
+        je_a, je_b = iv["jeta"][:, :, 0], iv["jeta"][:, :, 1]
+        tau = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
+        for g0 in range(0, ngpt, _GPT_CHUNK):
+            g1 = min(g0 + _GPT_CHUNK, ngpt)
+            g4 = xp.arange(g0, g1)[None, None, None, :]         # (1,1,1,ng)
+            iflav = gpf[g4, itropo] - 1                         # (nx,ny,nz,ng)
+            s1 = 1.0 if unit_scaling else cm0[si, ei, li, iflav]
+            s2 = 1.0 if unit_scaling else cm1[si, ei, li, iflav]
+            f = {n: fmajor[:, :, e, p, t][si, ei, li, iflav]
+                 for n, (e, p, t) in _FMAJ_AXES.items()}
+            je1 = je_a[si, ei, li, iflav] - 1
+            je2 = je_b[si, ei, li, iflav] - 1
+            tau[:, :, :, g0:g1] = s1 * (
+                f["f111"] * table[jt, je1, jp, g4]
+                + f["f211"] * table[jt, je1 + 1, jp, g4]
+                + f["f121"] * table[jt, je1, jp + 1, g4]
+                + f["f221"] * table[jt, je1 + 1, jp + 1, g4]
+            ) + s2 * (
+                f["f112"] * table[jt + 1, je2, jp, g4]
+                + f["f212"] * table[jt + 1, je2 + 1, jp, g4]
+                + f["f122"] * table[jt + 1, je2, jp + 1, g4]
+                + f["f222"] * table[jt + 1, je2 + 1, jp + 1, g4]
+            )
+        return tau
+
     def _tau_absorption(self, atmosphere, interp):
         """Major-gas + minor-gas absorption tau -> (nx, ny, nz, ngpt)."""
         nx, ny, nz, ngpt = self.nx, self.ny, self.nz, self.ngpt
@@ -439,27 +487,9 @@ class GasOpticsGT4Py:
         xp = self._xp
         jtemp_q.view[:] = xp.asarray(iv["jtemp0"])
 
-        # --- major gas ------------------------------------------------------
-        tau_major = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
-        jpress_q.view[:] = xp.asarray(iv["jpress0"])
-        for g in range(ngpt):
-            iflav = (gpf[g, iv["itropo"]] - 1).astype(np.int64)
-            s1_q.view[:] = xp.asarray(col_mix[:, :, 0][si, ei, li, iflav])
-            s2_q.view[:] = xp.asarray(col_mix[:, :, 1][si, ei, li, iflav])
-            for name, (e, p, t) in _FMAJ_AXES.items():
-                fmaj_q[name].view[:] = xp.asarray(fmajor[:, :, e, p, t][si, ei, li, iflav])
-            jeta1_q.view[:] = xp.asarray((jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64))
-            jeta2_q.view[:] = xp.asarray((jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64))
-            igpt_q.view[:] = g
-            self._major(
-                scaling1=s1_q, scaling2=s2_q,
-                f111=fmaj_q["f111"], f211=fmaj_q["f211"], f121=fmaj_q["f121"],
-                f221=fmaj_q["f221"], f112=fmaj_q["f112"], f212=fmaj_q["f212"],
-                f122=fmaj_q["f122"], f222=fmaj_q["f222"],
-                jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q,
-                igpt=igpt_q, kmajor=self._kmajor, res=res_q,
-            )
-            tau_major[:, :, :, g] = res_q.view[:]
+        # --- major gas: all g-points at once (chunked), replacing the 256-call
+        # interp3d_major loop -- the launches were the cost, not the math.
+        tau_major = self._major_batched(iv, self._kmajor)
 
         # --- minor gas (lower then upper) -----------------------------------
         col_gas = xp.asarray(
@@ -606,23 +636,9 @@ class GasOpticsGT4Py:
         jtemp_q.view[:] = xp.asarray(iv["jtemp0"])
         jpress_q.view[:] = xp.asarray(iv["jpress0"])
 
-        pfrac = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
-        for g in range(ngpt):
-            iflav = (gpf[g, iv["itropo"]] - 1).astype(np.int64)
-            for name, (e, p, t) in _FMAJ_AXES.items():
-                fmaj_q[name].view[:] = xp.asarray(fmajor[:, :, e, p, t][si, ei, li, iflav])
-            jeta1_q.view[:] = xp.asarray((jeta[:, :, 0][si, ei, li, iflav] - 1).astype(np.int64))
-            jeta2_q.view[:] = xp.asarray((jeta[:, :, 1][si, ei, li, iflav] - 1).astype(np.int64))
-            igpt_q.view[:] = g
-            self._major(
-                scaling1=s1_q, scaling2=s2_q,
-                f111=fmaj_q["f111"], f211=fmaj_q["f211"], f121=fmaj_q["f121"],
-                f221=fmaj_q["f221"], f112=fmaj_q["f112"], f212=fmaj_q["f212"],
-                f122=fmaj_q["f122"], f222=fmaj_q["f222"],
-                jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q,
-                igpt=igpt_q, kmajor=self._pfracin, res=res_q,
-            )
-            pfrac[:, :, :, g] = res_q.view[:]
+        # pfrac is the same major interpolation with scaling=1 and the pfracin
+        # table; batch it over all g-points like the absorption major.
+        pfrac = self._major_batched(iv, self._pfracin, unit_scaling=True)
 
         # temperatures (upcast to float64 to match the Fortran index math)
         tlay_var = atmosphere.mapping.get_var("temp_layer")
