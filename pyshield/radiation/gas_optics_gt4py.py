@@ -189,9 +189,13 @@ class GasOpticsGT4Py:
         # __cuda_array_interface__". A probe Quantity reveals the backend's array
         # module (numpy on CPU, so this is a no-op there). kmajor + the minor kmin
         # tables are used by both SW and LW; krayl is SW-only, pfracin/totplnk LW.
-        _xp = array_module(self._ff(self._qf))
+        self._xp = array_module(self._ff(self._qf))
+        _xp = self._xp
         if _xp is not np:
             self._kmajor = _xp.asarray(self._kmajor)
+            # gpoint_flavor indexes the per-cell gathers; on-device so the gather
+            # (col_mix[si,ei,li,iflav] etc.) runs on the GPU instead of the host.
+            self._gpoint_flavor = _xp.asarray(self._gpoint_flavor)
             for _suffix in self._minor_tabs:
                 self._minor_tabs[_suffix]["kmin"] = _xp.asarray(
                     self._minor_tabs[_suffix]["kmin"]
@@ -241,6 +245,9 @@ class GasOpticsGT4Py:
         column layout and re-inserted in base[var]'s original dim order so the
         RTE solver sees an unchanged container.
         """
+        # The compute path runs on the backend device (cupy on GPU); cross back
+        # to host here, the one place results re-enter the pyRTE xarray dataset.
+        result = to_host(result)
         da = base[var]
         b = da.transpose(*self._noncore, *core_dims)
         core_shape = result.shape[2:]
@@ -269,7 +276,9 @@ class GasOpticsGT4Py:
         val0 = (temp - temp_ref_min) / totplnk_delta
         iv = val0.astype(np.int64)  # trunc toward zero, as Fortran int()
         frac = val0 - iv
-        idx0 = np.clip(iv, 0, nplancktemp - 2).astype(np.int64)
+        # .clip is an ndarray method on both numpy and cupy, so this stays on
+        # whichever device `temp` lives on (numpy on CPU, cupy on GPU).
+        idx0 = iv.clip(0, nplancktemp - 2).astype(np.int64)
         return idx0, frac
 
     def _toa_source(self, atmosphere, base):
@@ -350,8 +359,8 @@ class GasOpticsGT4Py:
             tau_rayl = self._tau_rayleigh(interp)
             tau = tau_abs + tau_rayl
             tiny = 2.0 * np.finfo(np.float64).tiny
-            ssa = np.where(tau > tiny, tau_rayl / tau, 0.0)
-            g = np.zeros_like(tau)
+            ssa = self._xp.where(tau > tiny, tau_rayl / tau, 0.0)
+            g = self._xp.zeros_like(tau)
             self._write(base, "tau", tau, [layer_dim, "gpt"])
             self._write(base, "ssa", ssa, [layer_dim, "gpt"])
             self._write(base, "g", g, [layer_dim, "gpt"])
@@ -371,27 +380,36 @@ class GasOpticsGT4Py:
         """Tiled interpolation intermediates shared across the gathers."""
         ld = self._layer_dim
         nx, ny, nz = self.nx, self.ny, self.nz
+        xp = self._xp
+        # Everything the per-g-point gathers touch lives on the backend device
+        # (cupy on GPU), so the fancy-index gathers run there instead of on the
+        # host. _tile returns host numpy from the pyRTE xarray; xp.asarray moves
+        # it (a no-op on CPU, where xp is numpy).
         iv = {}
-        iv["jtemp0"] = (self._tile(interp["temperature_index"], [ld]) - 1).astype(np.int64)
-        jpress_f = self._tile(interp["pressure_index"], [ld])
-        tropo = self._tile(interp["tropopause_mask"], [ld]).astype(bool)
+        iv["jtemp0"] = xp.asarray(
+            (self._tile(interp["temperature_index"], [ld]) - 1).astype(np.int64)
+        )
+        jpress_f = xp.asarray(self._tile(interp["pressure_index"], [ld]))
+        tropo = xp.asarray(self._tile(interp["tropopause_mask"], [ld]).astype(bool))
         iv["tropo"] = tropo
-        itropo = np.where(tropo, 0, 1).astype(np.int64)  # 0=lower/tropo, 1=upper
+        itropo = xp.where(tropo, 0, 1).astype(np.int64)  # 0=lower/tropo, 1=upper
         iv["itropo"] = itropo
         iv["jpress0"] = (jpress_f + itropo - 1).astype(np.int64)
         # (nx,ny,2,nz,nflav) -> col_mix[:,:,0/1]
-        iv["col_mix"] = self._tile(interp["column_mix"], ["temp_interp", ld, "flavor"])
+        iv["col_mix"] = xp.asarray(
+            self._tile(interp["column_mix"], ["temp_interp", ld, "flavor"])
+        )
         # (nx,ny,2,2,2,nz,nflav)
-        iv["fmajor"] = self._tile(
+        iv["fmajor"] = xp.asarray(self._tile(
             interp["fmajor"], ["eta_interp", "press_interp", "temp_interp", ld, "flavor"]
-        )
+        ))
         # (nx,ny,2,2,nz,nflav)
-        iv["fminor"] = self._tile(
+        iv["fminor"] = xp.asarray(self._tile(
             interp["fminor"], ["eta_interp", "temp_interp", ld, "flavor"]
-        )
+        ))
         # (nx,ny,2,nz,nflav)
-        iv["jeta"] = self._tile(interp["eta_index"], ["pair", ld, "flavor"])
-        iv["si"], iv["ei"], iv["li"] = np.indices((nx, ny, nz))
+        iv["jeta"] = xp.asarray(self._tile(interp["eta_index"], ["pair", ld, "flavor"]))
+        iv["si"], iv["ei"], iv["li"] = xp.asarray(np.indices((nx, ny, nz)))
         return iv
 
     def _tau_absorption(self, atmosphere, interp):
@@ -414,15 +432,15 @@ class GasOpticsGT4Py:
         )
         fmn_q = {n: self._ff(qf) for n in ("fmn11", "fmn21", "fmn12", "fmn22")}
         res_q = self._ff(qf)
-        # Gathers stay on host (numpy advanced indexing); each per-g-point slab
-        # uploads to the device via xp.asarray before the device Quantity view
-        # assignment, and accumulator reads come back with to_host. Scalar fills
-        # (view[:] = g) are fine as-is on cupy.
-        xp = array_module(res_q)
+        # The gather operands (col_mix/fmajor/fminor/jeta + si/ei/li, and gpf +
+        # itropo) are on the backend device (_shared_interp / __init__), so the
+        # fancy-index gathers run on the GPU; xp.asarray is then a no-op. The
+        # accumulators are device too, so no per-g-point host copy-back.
+        xp = self._xp
         jtemp_q.view[:] = xp.asarray(iv["jtemp0"])
 
         # --- major gas ------------------------------------------------------
-        tau_major = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
+        tau_major = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
         jpress_q.view[:] = xp.asarray(iv["jpress0"])
         for g in range(ngpt):
             iflav = (gpf[g, iv["itropo"]] - 1).astype(np.int64)
@@ -441,17 +459,23 @@ class GasOpticsGT4Py:
                 jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q,
                 igpt=igpt_q, kmajor=self._kmajor, res=res_q,
             )
-            tau_major[:, :, :, g] = to_host(res_q.view[:])
+            tau_major[:, :, :, g] = res_q.view[:]
 
         # --- minor gas (lower then upper) -----------------------------------
-        col_gas = self._tile(interp["gases_columns"], [ld, "gas"]).astype(np.float64)
+        col_gas = xp.asarray(
+            self._tile(interp["gases_columns"], [ld, "gas"]).astype(np.float64)
+        )
         pvar = atmosphere.mapping.get_var("pres_layer")
         tvar = atmosphere.mapping.get_var("temp_layer")
         tmpl = interp["temperature_index"]
-        play = self._tile(atmosphere[pvar].broadcast_like(tmpl), [ld]).astype(np.float64)
-        tlay = self._tile(atmosphere[tvar].broadcast_like(tmpl), [ld]).astype(np.float64)
+        play = xp.asarray(
+            self._tile(atmosphere[pvar].broadcast_like(tmpl), [ld]).astype(np.float64)
+        )
+        tlay = xp.asarray(
+            self._tile(atmosphere[tvar].broadcast_like(tmpl), [ld]).astype(np.float64)
+        )
 
-        tau_minor = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
+        tau_minor = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
         gas_names = self._pyrte._gas_names
         for suffix, atmos_half, layer_mask in (
             ("lower", 0, iv["tropo"]),
@@ -482,7 +506,7 @@ class GasOpticsGT4Py:
                         dry = 1.0 / (1.0 + col_gas[:, :, :, self._idx_h2o] * vmr)
                         fac = col_gas[:, :, :, idx_scal] * vmr * dry
                         scaling = scaling * ((1.0 - fac) if scomp[imnr] else fac)
-                scaling = np.where(layer_mask, scaling, 0.0)
+                scaling = xp.where(layer_mask, scaling, 0.0)
 
                 fmn_q["fmn11"].view[:] = xp.asarray(fminor[:, :, 0, 0][si, ei, li, iflav])
                 fmn_q["fmn21"].view[:] = xp.asarray(fminor[:, :, 1, 0][si, ei, li, iflav])
@@ -499,7 +523,7 @@ class GasOpticsGT4Py:
                         jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
                         kminor=kmin, res=res_q,
                     )
-                    tau_minor[:, :, :, g] += scaling * to_host(res_q.view[:])
+                    tau_minor[:, :, :, g] += scaling * res_q.view[:]
 
         return tau_major + tau_minor
 
@@ -507,21 +531,25 @@ class GasOpticsGT4Py:
         """Shortwave Rayleigh tau -> (nx, ny, nz, ngpt)."""
         nx, ny, nz, ngpt = self.nx, self.ny, self.nz, self.ngpt
         ld = self._layer_dim
-        # Rayleigh needs only fminor / eta_index / jtemp / tropo; build directly.
-        jtemp0 = (self._tile(interp["temperature_index"], [ld]) - 1).astype(np.int64)
-        tropo = self._tile(interp["tropopause_mask"], [ld]).astype(bool)
-        fminor = self._tile(
+        xp = self._xp
+        # Rayleigh needs only fminor / eta_index / jtemp / tropo; build directly,
+        # on the backend device so the gathers and reduction run there.
+        jtemp0 = xp.asarray(
+            (self._tile(interp["temperature_index"], [ld]) - 1).astype(np.int64)
+        )
+        tropo = xp.asarray(self._tile(interp["tropopause_mask"], [ld]).astype(bool))
+        fminor = xp.asarray(self._tile(
             interp["fminor"], ["eta_interp", "temp_interp", ld, "flavor"]
+        ))
+        jeta = xp.asarray(self._tile(interp["eta_index"], ["pair", ld, "flavor"]))
+        col_dry = xp.asarray(
+            self._tile(interp["gases_columns"].sel(gas="dry_air"), [ld]).astype(np.float64)
         )
-        jeta = self._tile(interp["eta_index"], ["pair", ld, "flavor"])
-        col_dry = self._tile(interp["gases_columns"].sel(gas="dry_air"), [ld]).astype(
-            np.float64
-        )
-        col_h2o = self._tile(interp["gases_columns"].sel(gas="h2o"), [ld]).astype(
-            np.float64
+        col_h2o = xp.asarray(
+            self._tile(interp["gases_columns"].sel(gas="h2o"), [ld]).astype(np.float64)
         )
         gpf = self._gpoint_flavor
-        si, ei, li = np.indices((nx, ny, nz))
+        si, ei, li = xp.asarray(np.indices((nx, ny, nz)))
 
         qf = self._qf
         fmn_q = {n: self._ff(qf) for n in ("fmn11", "fmn21", "fmn12", "fmn22")}
@@ -529,10 +557,9 @@ class GasOpticsGT4Py:
             self._fi(qf), self._fi(qf), self._fi(qf), self._fi(qf)
         )
         res_q = self._ff(qf)
-        xp = array_module(res_q)
         jtemp_q.view[:] = xp.asarray(jtemp0)
 
-        tau_rayl = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
+        tau_rayl = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
         for g in range(ngpt):
             k_half = {}
             for b, bi in (("lower", 0), ("upper", 1)):
@@ -550,8 +577,8 @@ class GasOpticsGT4Py:
                     jtemp=jtemp_q, jeta1=jeta1_q, jeta2=jeta2_q, kg=kg_q,
                     krayl=self._krayl[b], res=res_q,
                 )
-                k_half[b] = np.array(to_host(res_q.view[:]))
-            k = np.where(tropo, k_half["lower"], k_half["upper"])
+                k_half[b] = xp.array(res_q.view[:])
+            k = xp.where(tropo, k_half["lower"], k_half["upper"])
             tau_rayl[:, :, :, g] = k * (col_h2o + col_dry)
         return tau_rayl
 
@@ -575,11 +602,11 @@ class GasOpticsGT4Py:
         jtemp_q, jpress_q = self._fi(qf), self._fi(qf)
         jeta1_q, jeta2_q, igpt_q = self._fi(qf), self._fi(qf), self._fi(qf)
         res_q = self._ff(qf)
-        xp = array_module(res_q)
+        xp = self._xp
         jtemp_q.view[:] = xp.asarray(iv["jtemp0"])
         jpress_q.view[:] = xp.asarray(iv["jpress0"])
 
-        pfrac = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
+        pfrac = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
         for g in range(ngpt):
             iflav = (gpf[g, iv["itropo"]] - 1).astype(np.int64)
             for name, (e, p, t) in _FMAJ_AXES.items():
@@ -595,21 +622,23 @@ class GasOpticsGT4Py:
                 jtemp=jtemp_q, jpress=jpress_q, jeta1=jeta1_q, jeta2=jeta2_q,
                 igpt=igpt_q, kmajor=self._pfracin, res=res_q,
             )
-            pfrac[:, :, :, g] = to_host(res_q.view[:])
+            pfrac[:, :, :, g] = res_q.view[:]
 
         # temperatures (upcast to float64 to match the Fortran index math)
         tlay_var = atmosphere.mapping.get_var("temp_layer")
         tlev_var = atmosphere.mapping.get_var("temp_level")
         tsfc_var = atmosphere.mapping.get_var("surface_temperature")
         tmpl = interp["temperature_index"]
-        tlay = self._tile(atmosphere[tlay_var].broadcast_like(tmpl), [ld]).astype(np.float64)
-        tlev = self._tile(atmosphere[tlev_var], [lvd]).astype(np.float64)
-        tsfc = self._tile(atmosphere[tsfc_var], []).astype(np.float64)
+        tlay = xp.asarray(
+            self._tile(atmosphere[tlay_var].broadcast_like(tmpl), [ld]).astype(np.float64)
+        )
+        tlev = xp.asarray(self._tile(atmosphere[tlev_var], [lvd]).astype(np.float64))
+        tsfc = xp.asarray(self._tile(atmosphere[tsfc_var], []).astype(np.float64))
 
         sfc_lay0 = (nz - 1) if bool(base.attrs["top_at_1"]) else 0
 
         tmin, delta, ntp = self._temp_ref_min, self._totplnk_delta, self._nplancktemp
-        tsfc_b = np.broadcast_to(tsfc[:, :, None], (nx, ny, nz))
+        tsfc_b = xp.broadcast_to(tsfc[:, :, None], (nx, ny, nz))
         idx_lay, frac_lay = self._idx_frac(tlay, tmin, delta, ntp)
         idx_sfc, frac_sfc = self._idx_frac(tsfc_b, tmin, delta, ntp)
         idx_sfcd, frac_sfcd = self._idx_frac(tsfc_b + 1.0, tmin, delta, ntp)
@@ -633,10 +662,10 @@ class GasOpticsGT4Py:
         frac_lev_q.view[:] = xp.asarray(frac_lev)
         idx_lev_q.view[:] = xp.asarray(idx_lev)
 
-        sfc_src = np.zeros((nx, ny, ngpt), dtype=np.float64)
-        jac_src = np.zeros((nx, ny, ngpt), dtype=np.float64)
-        lay_src = np.zeros((nx, ny, nz, ngpt), dtype=np.float64)
-        lev_src = np.zeros((nx, ny, nlev, ngpt), dtype=np.float64)
+        sfc_src = xp.zeros((nx, ny, ngpt), dtype=np.float64)
+        jac_src = xp.zeros((nx, ny, ngpt), dtype=np.float64)
+        lay_src = xp.zeros((nx, ny, nz, ngpt), dtype=np.float64)
+        lev_src = xp.zeros((nx, ny, nlev, ngpt), dtype=np.float64)
 
         for ibnd in range(self._band_lims.shape[1]):
             gptS0 = int(self._band_lims[0, ibnd]) - 1
@@ -652,10 +681,11 @@ class GasOpticsGT4Py:
             self._planck_lev(frac=frac_lev_q, idx=idx_lev_q, iband=iband_lev_q,
                              totplnk=self._totplnk, planck=planck_lev_q)
 
-            pl_lay = to_host(planck_lay_q.view[:])
-            pl_sfc = to_host(planck_sfc_q.view[:, :, 0])
-            pl_sfcd = to_host(planck_sfcd_q.view[:, :, 0])
-            pl_lev = to_host(planck_lev_q.view[:])
+            # device views (no host copy-back; the assembly below is all device)
+            pl_lay = planck_lay_q.view[:]
+            pl_sfc = planck_sfc_q.view[:, :, 0]
+            pl_sfcd = planck_sfcd_q.view[:, :, 0]
+            pl_lev = planck_lev_q.view[:]
 
             for g in range(gptS0, gptE0 + 1):
                 pf = pfrac[:, :, :, g]
@@ -665,7 +695,7 @@ class GasOpticsGT4Py:
                 lev_src[:, :, 0, g] = pf[:, :, 0] * pl_lev[:, :, 0]
                 lev_src[:, :, nz, g] = pf[:, :, nz - 1] * pl_lev[:, :, nz]
                 lev_src[:, :, 1:nz, g] = (
-                    np.sqrt(pf[:, :, 0 : nz - 1] * pf[:, :, 1:nz]) * pl_lev[:, :, 1:nz]
+                    xp.sqrt(pf[:, :, 0 : nz - 1] * pf[:, :, 1:nz]) * pl_lev[:, :, 1:nz]
                 )
 
         return sfc_src, lay_src, lev_src, jac_src
