@@ -41,8 +41,14 @@ import numpy as np
 # Keep the benchmark output clean even if the model env exported this.
 os.environ.pop("GEOS_RRTMGP_DEBUG", None)
 
-# Single-tile size one rank owns in the c180 L91 run.
-NX, NY, NZ, NHALO = 45, 90, 91, 3
+# Single-tile size one rank owns in the c180 L91 run. Overridable via env so the
+# same harness can measure how GPU memory scales with column count (BENCH_NX x
+# BENCH_NY) at fixed depth -- used to split the per-rank footprint into the fixed
+# coefficient-table floor vs the part that scales with columns (column-blocking).
+NX = int(os.environ.get("BENCH_NX", "45"))
+NY = int(os.environ.get("BENCH_NY", "90"))
+NZ = int(os.environ.get("BENCH_NZ", "91"))
+NHALO = 3
 NCOL = NX * NY
 NITER = int(os.environ.get("BENCH_ITERS", "5"))
 
