@@ -1151,7 +1151,9 @@ class RTE_RRTMGPDriver:
                 for b in range(self._nblocks)
             ]
 
-        xp = array_module(outs[0]["fswd"])
+        # Backend array module from a state Quantity (the solver outputs are raw
+        # arrays, not Quantities, so array_module can't read them directly).
+        xp = array_module(state.fswd)
 
         def _write(key, dst):
             arr = (
