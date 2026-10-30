@@ -1,4 +1,5 @@
 import datetime
+import os
 
 import numpy as np
 from pyrte_rrtmgp import rte
@@ -323,16 +324,41 @@ class RTE_RRTMGPDriver:
         # count is nic*njc = domain_compute()[:2] and its layer count is npz.
         nx, ny, nz = grid_indexing.domain_compute()
         gas_optics_backend = quantity_factory.backend
+
+        # Column blocking. The optics (gas + cloud) hold the whole tile's
+        # (cols, layer, gpt) arrays resident on the device at once, so per-rank
+        # GPU memory scales with the column count (measured ~0.5 GB fixed floor +
+        # ~2.68 MiB/column). To bound it, process the rank's `nx` rows in chunks
+        # of `block_rows` rows -- each chunk is a clean (block_rows, ny) tile, and
+        # radiation is column-independent so the result is identical to the whole
+        # tile. The optics/solvers below are built at the BLOCK tile (bx, ny); the
+        # state, the heating stencil and the I/J fields stay at the full (nx, ny).
+        # OFF by default (block_rows = full nx = one block = whole-tile behavior);
+        # the model sets GEOS_RRTMGP_BLOCK_ROWS to turn it on. Must divide nx.
+        block_rows = int(os.environ.get("GEOS_RRTMGP_BLOCK_ROWS", "0"))
+        if block_rows and 0 < block_rows < nx:
+            assert nx % block_rows == 0, (
+                f"GEOS_RRTMGP_BLOCK_ROWS={block_rows} must divide nx={nx}"
+            )
+            self._block_rows = block_rows
+            self._nblocks = nx // block_rows
+            bx = block_rows
+        else:
+            self._block_rows = None
+            self._nblocks = 1
+            bx = nx
+        self._nx_full = nx
+
         self._gas_optics_lw = GasOpticsGT4Py(
             gas_optics_file=GasOpticsFiles.LW_G256,
-            nx=nx,
+            nx=bx,
             ny=ny,
             nz=nz,
             backend=gas_optics_backend,
         )
         self._gas_optics_sw = GasOpticsGT4Py(
             gas_optics_file=GasOpticsFiles.SW_G224,
-            nx=nx,
+            nx=bx,
             ny=ny,
             nz=nz,
             backend=gas_optics_backend,
@@ -345,14 +371,14 @@ class RTE_RRTMGPDriver:
         # slice, so it is NOT overridden.
         self._cloud_optics_lw = CloudOpticsGT4Py(
             cloud_optics_file=CloudOpticsFiles.LW_BND,
-            nx=nx,
+            nx=bx,
             ny=ny,
             nz=nz,
             backend=gas_optics_backend,
         )
         self._cloud_optics_sw = CloudOpticsGT4Py(
             cloud_optics_file=CloudOpticsFiles.SW_BND,
-            nx=nx,
+            nx=bx,
             ny=ny,
             nz=nz,
             backend=gas_optics_backend,
@@ -385,10 +411,12 @@ class RTE_RRTMGPDriver:
         # (calc_tlvl_gfs places the surface at K=0), so the compiled assumption
         # is top_at_1 = False. step_radiation asserts the runtime optics match
         # before using these solvers.
-        self._nx, self._ny, self._nz = nx, ny, nz
+        # Solver/optics tile = the BLOCK tile (bx, ny). _solve_* use self._nx/_ny
+        # for the per-block reshape; the full tile is self._nx_full.
+        self._nx, self._ny, self._nz = bx, ny, nz
         self._solver_top_at_1 = False
         self._lw_solver = LWNoScatSolverGT4Py(
-            nx=nx,
+            nx=bx,
             ny=ny,
             nz=nz,
             ngpt=NGPT_LW,
@@ -396,7 +424,7 @@ class RTE_RRTMGPDriver:
             top_at_1=self._solver_top_at_1,
         )
         self._sw_solver = SWTwoStreamSolverGT4Py(
-            nx=nx,
+            nx=bx,
             ny=ny,
             nz=nz,
             ngpt=NGPT_SW,
@@ -998,24 +1026,13 @@ class RTE_RRTMGPDriver:
             sfc_emis=emis,
         )
 
-    def step_radiation(
-        self, state: RTE_RRTMGPState, sfc_state: SurfaceState, date: datetime.datetime
-    ):
+    def _radiate(self, radx):
+        """Run SW + LW radiation on one column tile and return the eight broadband
+        flux arrays, each (bx, by, nlev). `radx` is the whole-tile input, or a
+        column block of it when blocking is on -- every per-column input
+        (albedo, mu0, sfc_emis) is read from it, so a sliced radx radiates only
+        that block. No state writes; step_radiation assembles the blocks.
         """
-        Method to compute radiative fluxes for a given atmospheric and surface state
-        at a given date and time. The Radiation State is updated with longwave and
-        shortwave fluxes and heating rates in-place.
-
-        Args:
-            state (RTE_RRTMGPState): input state containing atmospheric information,
-                will be updated with radiative fluxes and heating rates
-            sfc_state (SurfaceState): contains surface properties such as
-                surface type, snow cover, etc.
-            date (datetime.datetime): datetime for radiation calculations
-        """
-        self.solhr = date.hour + date.minute / 60.0 + date.second / 3600.0
-        radx = self.prep_radiation(state, sfc_state, date)
-
         # Do SW fluxes:
         sw_optics = self._gas_optics_sw.compute(
             radx,
@@ -1031,8 +1048,6 @@ class RTE_RRTMGPDriver:
         # extraction mirrors tests/rte_solver/test_sw_solver_gt4py.py.
         sw_tiles = self._gas_optics_sw.device_tiles  # None unless resident
         bb_up_sw, bb_dn_sw, _bb_dir_sw = self._solve_sw_clear(sw_optics, sw_tiles)
-        state.fswd_clr.view[:] = bb_dn_sw.reshape(state.fswd_clr.view[:].shape)
-        state.fswu_clr.view[:] = bb_up_sw.reshape(state.fswu_clr.view[:].shape)
 
         sw_cloud_optical_props = self._cloud_optics_sw.compute(
             radx,
@@ -1056,8 +1071,6 @@ class RTE_RRTMGPDriver:
         bb_up_sw_all, bb_dn_sw_all, _bb_dir_sw_all = self._solve_sw_allsky(
             sw_optics, sw_tiles
         )
-        state.fswd.view[:] = bb_dn_sw_all.reshape(state.fswd.view[:].shape)
-        state.fswu.view[:] = bb_up_sw_all.reshape(state.fswu.view[:].shape)
 
         # And do LW fluxes
         lw_optics = self._gas_optics_lw.compute(
@@ -1073,8 +1086,6 @@ class RTE_RRTMGPDriver:
         # extraction mirrors tests/rte_solver/test_lw_solver_gt4py.py.
         lw_tiles = self._gas_optics_lw.device_tiles  # None unless resident
         bb_up_lw, bb_dn_lw = self._solve_lw_clear(lw_optics, lw_tiles)
-        state.flwd_clr.view[:] = bb_dn_lw.reshape(state.flwd_clr.view[:].shape)
-        state.flwu_clr.view[:] = bb_up_lw.reshape(state.flwu_clr.view[:].shape)
         lw_cloud_optical_props = self._cloud_optics_lw.compute(
             radx,
             problem_type=rte.OpticsTypes.ABSORPTION,
@@ -1097,8 +1108,67 @@ class RTE_RRTMGPDriver:
         # tests/rte_solver/test_lw_solver_allsky_gt4py.py. Replaces the former
         # pyRTE lw_optics.rte.solve(add_to_input=False).
         bb_up_lw_all, bb_dn_lw_all = self._solve_lw_allsky(lw_optics, lw_tiles)
-        state.flwd.view[:] = bb_dn_lw_all.reshape(state.flwd.view[:].shape)
-        state.flwu.view[:] = bb_up_lw_all.reshape(state.flwu.view[:].shape)
+
+        return {
+            "fswd": bb_dn_sw_all, "fswu": bb_up_sw_all,
+            "fswd_clr": bb_dn_sw, "fswu_clr": bb_up_sw,
+            "flwd": bb_dn_lw_all, "flwu": bb_up_lw_all,
+            "flwd_clr": bb_dn_lw, "flwu_clr": bb_up_lw,
+        }
+
+    def step_radiation(
+        self, state: RTE_RRTMGPState, sfc_state: SurfaceState, date: datetime.datetime
+    ):
+        """
+        Method to compute radiative fluxes for a given atmospheric and surface state
+        at a given date and time. The Radiation State is updated with longwave and
+        shortwave fluxes and heating rates in-place.
+
+        Args:
+            state (RTE_RRTMGPState): input state containing atmospheric information,
+                will be updated with radiative fluxes and heating rates
+            sfc_state (SurfaceState): contains surface properties such as
+                surface type, snow cover, etc.
+            date (datetime.datetime): datetime for radiation calculations
+        """
+        self.solhr = date.hour + date.minute / 60.0 + date.second / 3600.0
+        radx = self.prep_radiation(state, sfc_state, date)
+
+        # Column blocking: radiate the full tile at once (blocking off), or split
+        # it into blocks of `block_rows` nx-rows (one clean (block_rows, ny) tile
+        # each) and radiate each, to bound per-rank GPU memory. Radiation is
+        # column-independent, so the assembled result is identical to the whole
+        # tile. radx's "column" axis is nx-major (reshape(-1, nz) of (nx, ny, nz)),
+        # so block b is rows [b*block_rows, (b+1)*block_rows) = the contiguous
+        # column span below, and concatenating the blocks' (block_rows, ny, nlev)
+        # outputs along axis 0 rebuilds the full (nx, ny, nlev).
+        if self._block_rows is None:
+            outs = [self._radiate(radx)]
+        else:
+            cols = self._block_rows * self._ny  # columns per block
+            outs = [
+                self._radiate(radx.isel(column=slice(b * cols, (b + 1) * cols)))
+                for b in range(self._nblocks)
+            ]
+
+        xp = array_module(outs[0]["fswd"])
+
+        def _write(key, dst):
+            arr = (
+                outs[0][key]
+                if len(outs) == 1
+                else xp.concatenate([o[key] for o in outs], axis=0)
+            )
+            dst.view[:] = arr.reshape(dst.view[:].shape)
+
+        _write("fswd_clr", state.fswd_clr)
+        _write("fswu_clr", state.fswu_clr)
+        _write("fswd", state.fswd)
+        _write("fswu", state.fswu)
+        _write("flwd_clr", state.flwd_clr)
+        _write("flwu_clr", state.flwu_clr)
+        _write("flwd", state.flwd)
+        _write("flwu", state.flwu)
 
         self._calc_net_flux_and_heating(
             state.fswu,
