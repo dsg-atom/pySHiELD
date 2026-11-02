@@ -16,15 +16,18 @@
 void geos_rrtmgp_interface_c_init(
     MPI_Fint comm_f,
     int nx, int ny, int nz, int nhalo, int top_at_1,
-    int yy, int mm, int dd, int hh, int mn, int sc, double dt)
+    int yy, int mm, int dd, int hh, int mn, int sc, double dt,
+    double* lons, double* lats)
 {
     /* Radiation is column-independent and ignores the comm (the Python
        trampoline drops it); pass the Fortran int handle straight through so the
-       C ABI is int->int. No MPI_Comm_f2c needed. */
+       C ABI is int->int. No MPI_Comm_f2c needed. lons/lats are the real
+       per-cell grid coords (radians), (ncol,). */
     geos_rrtmgp_interface_py_init(
         comm_f,
         nx, ny, nz, nhalo, top_at_1,
-        yy, mm, dd, hh, mn, sc, dt);
+        yy, mm, dd, hh, mn, sc, dt,
+        lons, lats);
 }
 
 void geos_rrtmgp_interface_c(

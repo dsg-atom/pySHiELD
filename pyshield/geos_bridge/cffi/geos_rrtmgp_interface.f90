@@ -24,7 +24,8 @@ module geos_rrtmgp_interface_mod
      subroutine geos_rrtmgp_interface_f_init( &
           comm, &
           nx, ny, nz, nhalo, top_at_1, &
-          yy, mm, dd, hh, mn, sc, dt &
+          yy, mm, dd, hh, mn, sc, dt, &
+          lons, lats &
           ) bind(c, name='geos_rrtmgp_interface_c_init')
 
        import c_int, c_double
@@ -35,6 +36,8 @@ module geos_rrtmgp_interface_mod
        integer(kind=c_int), value, intent(in) :: top_at_1       ! 1 = top-down (GEOS)
        integer(kind=c_int), value, intent(in) :: yy, mm, dd, hh, mn, sc
        real(kind=c_double), value, intent(in) :: dt             ! radiation timestep [s]
+       ! real per-cell grid coords (radians), (ncol,) = nx*ny, same fold as islmsk
+       real(kind=c_double), dimension(*), intent(in) :: lons, lats
 
      end subroutine geos_rrtmgp_interface_f_init
 

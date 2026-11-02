@@ -40,6 +40,9 @@ program geos_rrtmgp_driver
   real(c_double) :: qvapor(NCOL*NZ), qo3mr(NCOL*NZ), co2(NCOL*NZ)
   real(c_double) :: qliquid(NCOL*NZ), qice(NCOL*NZ), qcld(NCOL*NZ)
   real(c_double) :: sfc_tsfc(NCOL), islmsk(NCOL)
+  ! Grid coords (radians); zeros = (0 lon, 0 lat), which at the init noon is
+  ! daytime -> a nonzero-SW check for the standalone driver.
+  real(c_double) :: grid_lons(NCOL), grid_lats(NCOL)
 
   ! Outputs
   real(c_double) :: flwu(NCOL*NLEV), flwd(NCOL*NLEV), fswu(NCOL*NLEV), fswd(NCOL*NLEV)
@@ -80,6 +83,8 @@ program geos_rrtmgp_driver
      tsfc(c)     = 288.0_c_double
      sfc_tsfc(c) = 288.0_c_double
      islmsk(c)   = 0.0_c_double   ! ocean
+     grid_lons(c) = 0.0_c_double
+     grid_lats(c) = 0.0_c_double
   end do
 
   ! Zero the outputs so a short copy-back would be visibly detectable.
@@ -98,7 +103,8 @@ program geos_rrtmgp_driver
   call geos_rrtmgp_interface_f_init( &
        MPI_COMM_WORLD, &
        NX, NY, NZ, NHALO, TOP_AT_1, &
-       2020, 1, 1, 12, 0, 0, DT)
+       2020, 1, 1, 12, 0, 0, DT, &
+       grid_lons, grid_lats)
   call ieee_set_halting_mode(ieee_all, halting_mode)
 
   ! --- run ---

@@ -44,7 +44,9 @@ header = """
 extern void geos_rrtmgp_interface_py_init(
     __MPI_COMM_T__ comm_c,
     int nx, int ny, int nz, int nhalo, int top_at_1,
-    int yy, int mm, int dd, int hh, int mn, int sc, double dt
+    int yy, int mm, int dd, int hh, int mn, int sc, double dt,
+    // real per-cell grid coords (radians), (ncol,) = nx*ny, same fold as islmsk
+    double* lons, double* lats
 );
 extern void geos_rrtmgp_interface_py(
     __MPI_COMM_T__ comm_c,
@@ -73,6 +75,7 @@ extern void geos_rrtmgp_interface_py_finalize();
 # ---------------------------------------------------------------------------
 source = r'''
 import datetime
+import numpy as np
 
 # Make the Fork-A venv importable to this EMBEDDED interpreter. The .so embeds
 # GEOSpyD's base libpython, whose default sys.path has mpi4py/numpy but NOT the
@@ -210,6 +213,7 @@ def geos_rrtmgp_interface_py_init(
     comm_c,
     nx, ny, nz, nhalo, top_at_1,
     yy, mm, dd, hh, mn, sc, dt,
+    lons, lats,
 ):
     global _CONV, _TOP_AT_1
     # comm reconstructed for symmetry / future multi-rank; the single-tile driver
@@ -221,15 +225,29 @@ def geos_rrtmgp_interface_py_init(
         yy, mm, dd, hh, mn, sc, tzinfo=datetime.timezone.utc
     )
     config = config_from_env(dt, date)
-    lons, lats, sigma = grid_from_env(nx, ny, nz)
+
+    # Real per-cell grid longitude/latitude (radians) from GEOS, passed by the
+    # GridComp. They are flat (ncol,) in the SAME fold as the islmsk/tsfc col
+    # inputs (a 1-D "col" buffer is a no-op fold regardless of array order), and
+    # geos_rrtmgp_init reshapes them (nx, ny) C-order -- the same reshape
+    # marshal_field_in uses -- so each cell's lon/lat matches its atmospheric
+    # column. Copy out of the Fortran-owned buffer (valid only during this call).
+    # Previously these came from grid_from_env and defaulted to zeros, putting
+    # every column at (0, 0) -> one solar geometry -> SW = 0 everywhere at night.
+    # sigma still comes from env (real vertical coordinate is a separate TODO).
+    ncol = nx * ny
+    itemsize = ffi.sizeof("double")
+    lons_np = np.frombuffer(ffi.buffer(lons, ncol * itemsize), dtype=np.float64).copy()
+    lats_np = np.frombuffer(ffi.buffer(lats, ncol * itemsize), dtype=np.float64).copy()
+    _, _, sigma = grid_from_env(nx, ny, nz)
 
     geos_rrtmgp_init(
         config=config,
         nx=nx,
         ny=ny,
         nz=nz,
-        lons=lons,
-        lats=lats,
+        lons=lons_np,
+        lats=lats_np,
         sigma=sigma,
         nhalo=nhalo,
         backend=None,          # geos_rrtmgp_init reads GEOS_RRTMGP_BACKEND env
