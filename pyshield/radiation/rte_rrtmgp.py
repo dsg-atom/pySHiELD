@@ -349,6 +349,13 @@ class RTE_RRTMGPDriver:
             bx = nx
         self._nx_full = nx
 
+        # LW-only driving mode: skip the shortwave path entirely. In the IRRAD
+        # bridge (RUN_RRTMGP_GT4PY=2) the model uses native SW and discards the
+        # bridge's SW, so computing it is wasted work (the profile's single
+        # largest cost). The LW result is byte-identical to a full run. OFF by
+        # default; the model sets GEOS_RRTMGP_LW_ONLY=1 for the LW-only mode.
+        self._lw_only = bool(int(os.environ.get("GEOS_RRTMGP_LW_ONLY", "0") or "0"))
+
         self._gas_optics_lw = GasOpticsGT4Py(
             gas_optics_file=GasOpticsFiles.LW_G256,
             nx=bx,
@@ -1026,53 +1033,65 @@ class RTE_RRTMGPDriver:
             sfc_emis=emis,
         )
 
-    def _radiate(self, radx):
-        """Run SW + LW radiation on one column tile and return the eight broadband
-        flux arrays, each (bx, by, nlev). `radx` is the whole-tile input, or a
-        column block of it when blocking is on -- every per-column input
-        (albedo, mu0, sfc_emis) is read from it, so a sliced radx radiates only
-        that block. No state writes; step_radiation assembles the blocks.
+    def _radiate(self, radx, lw_only=False):
+        """Run radiation on one column tile and return the broadband flux arrays,
+        each (bx, by, nlev). `radx` is the whole-tile input, or a column block of
+        it when blocking is on -- every per-column input (albedo, mu0, sfc_emis)
+        is read from it, so a sliced radx radiates only that block. No state
+        writes; step_radiation assembles the blocks.
+
+        When `lw_only` is set, the entire shortwave path (gas optics, cloud
+        optics, both solves) is SKIPPED and only the four LW fields are returned.
+        In the LW-only driving mode (IRRAD bridge, RUN_RRTMGP_GT4PY=2) the model
+        discards the bridge's SW anyway, so computing it is pure waste -- and the
+        profile showed that discarded SW (led by _tau_rayleigh) is the single
+        largest cost. The LW result is byte-identical to a full run.
         """
-        # Do SW fluxes:
-        sw_optics = self._gas_optics_sw.compute(
-            radx,
-            problem_type=rte.OpticsTypes.TWO_STREAM,
-            add_to_input=False,
-            gas_name_map=self._gas_mapping,
-            variable_mapping=self._atm_map,
-        )
-        sw_optics["surface_albedo"] = radx["albedo"]
-        sw_optics["mu0"] = radx["mu0"]
-        # Clear-sky SW solve: validated GT4Py two-stream solver (replaces the
-        # pyRTE sw_optics.rte.solve for the clear-sky path only). Input
-        # extraction mirrors tests/rte_solver/test_sw_solver_gt4py.py.
-        sw_tiles = self._gas_optics_sw.device_tiles  # None unless resident
-        bb_up_sw, bb_dn_sw, _bb_dir_sw = self._solve_sw_clear(sw_optics, sw_tiles)
+        out = {}
+        if not lw_only:
+            # Do SW fluxes:
+            sw_optics = self._gas_optics_sw.compute(
+                radx,
+                problem_type=rte.OpticsTypes.TWO_STREAM,
+                add_to_input=False,
+                gas_name_map=self._gas_mapping,
+                variable_mapping=self._atm_map,
+            )
+            sw_optics["surface_albedo"] = radx["albedo"]
+            sw_optics["mu0"] = radx["mu0"]
+            # Clear-sky SW solve: validated GT4Py two-stream solver (replaces the
+            # pyRTE sw_optics.rte.solve for the clear-sky path only). Input
+            # extraction mirrors tests/rte_solver/test_sw_solver_gt4py.py.
+            sw_tiles = self._gas_optics_sw.device_tiles  # None unless resident
+            bb_up_sw, bb_dn_sw, _bb_dir_sw = self._solve_sw_clear(sw_optics, sw_tiles)
 
-        sw_cloud_optical_props = self._cloud_optics_sw.compute(
-            radx,
-            problem_type=rte.OpticsTypes.TWO_STREAM,
-            add_to_input=False,
-            variable_mapping=self._atm_map,
-        )
-        # Fold the by-band GT4Py cloud optics into the by-g-point gas optics in
-        # place (replaces pyRTE's sw_cloud_optical_props.rte.add_to(sw_optics);
-        # the GT4Py add_to needs the explicit g-point->band map). This runs AFTER
-        # the clear-sky solve above has read the gas-only optics, so it does not
-        # retroactively change the clear-sky result.
-        self._cloud_optics_sw.add_to(
-            sw_optics, sw_cloud_optical_props, self._gpt2band_sw, gas_tiles=sw_tiles
-        )
-        # All-sky SW solve: the SAME validated GT4Py two-stream solver, now fed
-        # the COMBINED gas+cloud optics (add_to above mutated sw_optics in place,
-        # so tau/ssa/g carry real cloud asymmetry g != 0). Validated on g != 0 by
-        # tests/rte_solver/test_sw_solver_allsky_gt4py.py. Replaces the former
-        # pyRTE sw_optics.rte.solve(add_to_input=False).
-        bb_up_sw_all, bb_dn_sw_all, _bb_dir_sw_all = self._solve_sw_allsky(
-            sw_optics, sw_tiles
-        )
+            sw_cloud_optical_props = self._cloud_optics_sw.compute(
+                radx,
+                problem_type=rte.OpticsTypes.TWO_STREAM,
+                add_to_input=False,
+                variable_mapping=self._atm_map,
+            )
+            # Fold the by-band GT4Py cloud optics into the by-g-point gas optics
+            # in place (replaces pyRTE's sw_cloud_optical_props.rte.add_to; the
+            # GT4Py add_to needs the explicit g-point->band map). This runs AFTER
+            # the clear-sky solve above has read the gas-only optics, so it does
+            # not retroactively change the clear-sky result.
+            self._cloud_optics_sw.add_to(
+                sw_optics, sw_cloud_optical_props, self._gpt2band_sw, gas_tiles=sw_tiles
+            )
+            # All-sky SW solve: the SAME validated GT4Py two-stream solver, now
+            # fed the COMBINED gas+cloud optics (add_to above mutated sw_optics in
+            # place, so tau/ssa/g carry real cloud asymmetry g != 0). Validated on
+            # g != 0 by tests/rte_solver/test_sw_solver_allsky_gt4py.py.
+            bb_up_sw_all, bb_dn_sw_all, _bb_dir_sw_all = self._solve_sw_allsky(
+                sw_optics, sw_tiles
+            )
+            out.update(
+                fswd=bb_dn_sw_all, fswu=bb_up_sw_all,
+                fswd_clr=bb_dn_sw, fswu_clr=bb_up_sw,
+            )
 
-        # And do LW fluxes
+        # And do LW fluxes (always)
         lw_optics = self._gas_optics_lw.compute(
             radx,
             problem_type=rte.OpticsTypes.ABSORPTION,
@@ -1109,12 +1128,11 @@ class RTE_RRTMGPDriver:
         # pyRTE lw_optics.rte.solve(add_to_input=False).
         bb_up_lw_all, bb_dn_lw_all = self._solve_lw_allsky(lw_optics, lw_tiles)
 
-        return {
-            "fswd": bb_dn_sw_all, "fswu": bb_up_sw_all,
-            "fswd_clr": bb_dn_sw, "fswu_clr": bb_up_sw,
-            "flwd": bb_dn_lw_all, "flwu": bb_up_lw_all,
-            "flwd_clr": bb_dn_lw, "flwu_clr": bb_up_lw,
-        }
+        out.update(
+            flwd=bb_dn_lw_all, flwu=bb_up_lw_all,
+            flwd_clr=bb_dn_lw, flwu_clr=bb_up_lw,
+        )
+        return out
 
     def step_radiation(
         self, state: RTE_RRTMGPState, sfc_state: SurfaceState, date: datetime.datetime
@@ -1143,17 +1161,19 @@ class RTE_RRTMGPDriver:
         # column span below, and concatenating the blocks' (block_rows, ny, nlev)
         # outputs along axis 0 rebuilds the full (nx, ny, nlev).
         if self._block_rows is None:
-            outs = [self._radiate(radx)]
+            outs = [self._radiate(radx, self._lw_only)]
         else:
             cols = self._block_rows * self._ny  # columns per block
             outs = [
-                self._radiate(radx.isel(column=slice(b * cols, (b + 1) * cols)))
+                self._radiate(
+                    radx.isel(column=slice(b * cols, (b + 1) * cols)), self._lw_only
+                )
                 for b in range(self._nblocks)
             ]
 
         # Backend array module from a state Quantity (the solver outputs are raw
         # arrays, not Quantities, so array_module can't read them directly).
-        xp = array_module(state.fswd)
+        xp = array_module(state.flwd)
 
         def _write(key, dst):
             arr = (
@@ -1163,14 +1183,23 @@ class RTE_RRTMGPDriver:
             )
             dst.view[:] = arr.reshape(dst.view[:].shape)
 
-        _write("fswd_clr", state.fswd_clr)
-        _write("fswu_clr", state.fswu_clr)
-        _write("fswd", state.fswd)
-        _write("fswu", state.fswu)
+        # LW is always computed; the four fields are written from the solves.
         _write("flwd_clr", state.flwd_clr)
         _write("flwu_clr", state.flwu_clr)
         _write("flwd", state.flwd)
         _write("flwu", state.flwu)
+        if self._lw_only:
+            # SW was skipped (its outputs are discarded by the LW-only driver);
+            # zero the SW fields so the net-flux/heating stencil gets defined
+            # zeros rather than stale values. The LW-only driver discards the SW
+            # net/heating anyway.
+            for q in (state.fswd, state.fswu, state.fswd_clr, state.fswu_clr):
+                q.view[:] = 0.0
+        else:
+            _write("fswd_clr", state.fswd_clr)
+            _write("fswu_clr", state.fswu_clr)
+            _write("fswd", state.fswd)
+            _write("fswu", state.fswu)
 
         self._calc_net_flux_and_heating(
             state.fswu,
