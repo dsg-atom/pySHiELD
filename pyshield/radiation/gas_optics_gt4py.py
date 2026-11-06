@@ -346,36 +346,14 @@ class GasOpticsGT4Py:
         variable_mapping=None,
         add_to_input=False,
     ):
-        # --- pressure clamp (match native GEOS) ------------------------------
-        # pyRTE's interpolate (rrtmgp.py) RAISES "Layer pressures outside valid
-        # range" for any layer pressure <= press_min (~1.005 Pa) or >= press_max
-        # (~109663 Pa). GEOS's model top sits right at that floor, and the native
-        # GEOS RRTMGP path already klugges the top pressure (the Fortran
-        # "pressure KLUGE" in the Irrad/Solar GridComps) while the Fortran k-dist
-        # clamps the interpolation internally -- pyRTE rejects instead of
-        # clamping. Clamp pres_layer into the table range so the bridge matches
-        # native. The one-time print reports the pre-clamp extent and how many
-        # cells were out of range, so a benign model-top clamp is distinguished
-        # from a gross (units/unfilled-cell) error -- a Pa column reads
-        # max ~1e5, an hPa column ~1e3.
-        pvar = atmosphere.mapping.get_var("pres_layer")
-        pmin = float(self._pyrte.press_min)
-        pmax = float(self._pyrte.press_max)
-        lo, hi = pmin * (1.0 + 1e-6), pmax * (1.0 - 1e-6)
-        pl = atmosphere[pvar]
-        n_lo = int((pl < lo).sum())
-        n_hi = int((pl > hi).sum())
-        if (n_lo or n_hi) and not getattr(self, "_pclamp_warned", False):
-            self._pclamp_warned = True
-            print(
-                f"[GT4PY PCLAMP] {'SW' if self.is_sw else 'LW'} pres_layer "
-                f"min={float(pl.min()):.6g} max={float(pl.max()):.6g} "
-                f"press_min={pmin:.6g} press_max={pmax:.6g} "
-                f"n<min={n_lo} n>max={n_hi} (clamping into range)",
-                flush=True,
-            )
-        if n_lo or n_hi:
-            atmosphere[pvar] = pl.clip(lo, hi)
+        # NB: do NOT read atmosphere.mapping here, at the top of compute() --
+        # it is only populated by self._pyrte.compute() below, so get_var()
+        # returns None on the first call and atmosphere[None] raises KeyError
+        # (which the CFFI bridge silently swallows, crashing step_radiation
+        # before the SW solve). A former pressure clamp lived here and did
+        # exactly that. No clamp is needed: with the full-grid GEOS inputs the
+        # layer pressures are already inside the k-dist range (prsl ~1.9 Pa at
+        # the model top, above press_min ~1.005 Pa; max ~1e5 < press_max).
 
         # The output container (dims/coords/mapping/top_at_1) is grid-fixed, and
         # we overwrite every per-step field (tau/ssa/g and the sources) ourselves,
