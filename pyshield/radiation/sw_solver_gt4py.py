@@ -110,7 +110,8 @@ class SWTwoStreamSolverGT4Py:
             self._mu0.view[:, :, :nz] = mu0
             self._mu0.view[:, :, nz] = mu0[:, :, -1]
 
-    def solve(self, tau, ssa, g, mu0, sfc_alb_dir, sfc_alb_dif, inc_flux_dir):
+    def solve(self, tau, ssa, g, mu0, sfc_alb_dir, sfc_alb_dif, inc_flux_dir,
+              night_zero=False):
         """Broadband shortwave up/down/direct flux from the two-stream optics.
 
         Inputs (float64, folded to the (nx, ny) tile):
@@ -186,4 +187,23 @@ class SWTwoStreamSolverGT4Py:
         bb_up = xp.array(self._bb_up.view[:, :, :nlev])
         bb_dn = xp.array(self._bb_dn.view[:, :, :nlev])
         bb_dir = xp.array(self._bb_dir.view[:, :, :nlev])
+        if night_zero:
+            # Physical night mask for the driver: with the sun at or below the
+            # horizon (mu0 <= 0) there is no shortwave. The two-stream direct
+            # terms carry 1/mu0 and, at the min_mu0 clamp, emit ~1/min_mu0
+            # (~6.7e7 W/m2) spurious flux for such a column -- harmless in a
+            # sunlit-only native scheme, but the GEOS bridge runs the whole tile
+            # and the model's lit mask can disagree with mu0 at the terminator,
+            # so a handful of columns blow up. Zero them. (Off by default so the
+            # standalone solver tests stay bit-faithful to pyRTE, which keeps its
+            # by-design mu0<=0 negatives.)
+            # Threshold at MIN_MU0 (the solver's own clamp): any column with
+            # mu0 <= MIN_MU0 is run with mu0 pinned to MIN_MU0, which is exactly
+            # where the 1/mu0 terms emit the spurious ~1/MIN_MU0 flux. Those are
+            # physically sun-at-or-below-horizon columns -> zero.
+            mu0c = mu0 if mu0.ndim == 2 else mu0[:, :, 0]
+            night = (mu0c <= MIN_MU0)[:, :, None]
+            bb_up = xp.where(night, 0.0, bb_up)
+            bb_dn = xp.where(night, 0.0, bb_dn)
+            bb_dir = xp.where(night, 0.0, bb_dir)
         return bb_up, bb_dn, bb_dir

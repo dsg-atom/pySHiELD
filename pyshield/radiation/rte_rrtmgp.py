@@ -862,6 +862,7 @@ class RTE_RRTMGPDriver:
             sfc_alb_dir=alb_gpt,
             sfc_alb_dif=alb_gpt,
             inc_flux_dir=inc_dir,
+            night_zero=True,
         )
 
     def _solve_sw_allsky(self, sw_optics, tiles=None):
@@ -919,6 +920,7 @@ class RTE_RRTMGPDriver:
             sfc_alb_dir=alb_gpt,
             sfc_alb_dif=alb_gpt,
             inc_flux_dir=inc_dir,
+            night_zero=True,
         )
 
     def _solve_lw_clear(self, lw_optics, tiles=None):
