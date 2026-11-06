@@ -36,6 +36,9 @@ EPS = float(np.finfo(np.float64).eps)
 MIN_K = 1.0e4 * EPS
 MIN_MU0 = float(np.sqrt(EPS))
 
+# One-shot diagnostic guard for the driver night-mask path.
+_SWSOLVE_DIAG_DONE = False
+
 
 class SWTwoStreamSolverGT4Py:
     """Shortwave two-stream clear-sky RTE solver as GT4Py stencils."""
@@ -188,21 +191,31 @@ class SWTwoStreamSolverGT4Py:
         bb_dn = xp.array(self._bb_dn.view[:, :, :nlev])
         bb_dir = xp.array(self._bb_dir.view[:, :, :nlev])
         if night_zero:
-            # Physical night mask for the driver: with the sun at or below the
-            # horizon (mu0 <= 0) there is no shortwave. The two-stream direct
-            # terms carry 1/mu0 and, at the min_mu0 clamp, emit ~1/min_mu0
-            # (~6.7e7 W/m2) spurious flux for such a column -- harmless in a
-            # sunlit-only native scheme, but the GEOS bridge runs the whole tile
-            # and the model's lit mask can disagree with mu0 at the terminator,
-            # so a handful of columns blow up. Zero them. (Off by default so the
+            # Zero columns the model does not count as daytime. rad_astro's
+            # coszmn defines day as mean cos-zenith >= CZLIMT (1e-4, ~cos 89.99
+            # deg); below that the sun is at/below the horizon (no shortwave).
+            # The two-stream direct terms carry 1/mu0 and, for a column run near
+            # mu0 ~ 0, emit a spurious ~1/MIN_MU0 (~6.7e7 W/m2) flux. Native
+            # RRTMGP only solves sunlit columns; the GEOS bridge runs the whole
+            # tile, so these must be masked here. (Off by default so the
             # standalone solver tests stay bit-faithful to pyRTE, which keeps its
             # by-design mu0<=0 negatives.)
-            # Threshold at MIN_MU0 (the solver's own clamp): any column with
-            # mu0 <= MIN_MU0 is run with mu0 pinned to MIN_MU0, which is exactly
-            # where the 1/mu0 terms emit the spurious ~1/MIN_MU0 flux. Those are
-            # physically sun-at-or-below-horizon columns -> zero.
+            NIGHT_MU0 = 1.0e-4
             mu0c = mu0 if mu0.ndim == 2 else mu0[:, :, 0]
-            night = (mu0c <= MIN_MU0)[:, :, None]
+            global _SWSOLVE_DIAG_DONE
+            if not _SWSOLVE_DIAG_DONE:
+                _SWSOLVE_DIAG_DONE = True
+                print(
+                    f"[SWSOLVE] mu0 min={float(mu0c.min()):.4g} "
+                    f"max={float(mu0c.max()):.4g} "
+                    f"nnight={int((mu0c <= NIGHT_MU0).sum())}/{int(mu0c.size)} "
+                    f"raw bb_dn[min,max]={float(bb_dn.min()):.4g},"
+                    f"{float(bb_dn.max()):.4g} "
+                    f"bb_up[min,max]={float(bb_up.min()):.4g},"
+                    f"{float(bb_up.max()):.4g}",
+                    flush=True,
+                )
+            night = (mu0c <= NIGHT_MU0)[:, :, None]
             bb_up = xp.where(night, 0.0, bb_up)
             bb_dn = xp.where(night, 0.0, bb_dn)
             bb_dir = xp.where(night, 0.0, bb_dir)
