@@ -191,31 +191,41 @@ class SWTwoStreamSolverGT4Py:
         bb_dn = xp.array(self._bb_dn.view[:, :, :nlev])
         bb_dir = xp.array(self._bb_dir.view[:, :, :nlev])
         if night_zero:
-            # Zero columns the model does not count as daytime. rad_astro's
-            # coszmn defines day as mean cos-zenith >= CZLIMT (1e-4, ~cos 89.99
-            # deg); below that the sun is at/below the horizon (no shortwave).
-            # The two-stream direct terms carry 1/mu0 and, for a column run near
-            # mu0 ~ 0, emit a spurious ~1/MIN_MU0 (~6.7e7 W/m2) flux. Native
-            # RRTMGP only solves sunlit columns; the GEOS bridge runs the whole
-            # tile, so these must be masked here. (Off by default so the
-            # standalone solver tests stay bit-faithful to pyRTE, which keeps its
-            # by-design mu0<=0 negatives.)
+            # Zero columns that are either sub-horizon OR energy-violating.
+            # (1) Sub-horizon (mu0 <= NIGHT_MU0): rad_astro's coszmn floors night
+            #     to ~0 and the two-stream direct terms carry 1/mu0, unstable as
+            #     mu0 -> 0. Native RRTMGP solves only sunlit columns; the bridge
+            #     runs the whole tile, so mask these.
+            # (2) Energy-violating: in a thin grazing band (mu0 below ~0.02) the
+            #     ported two-stream can emit a flux LARGER than the column's own
+            #     TOA incoming -- impossible, since no level's up or down flux can
+            #     exceed the incoming beam. Zero exactly those columns; physical
+            #     columns (every flux <= incoming) are untouched, so no real
+            #     grazing sunlight is lost and no mu0 threshold has to be guessed.
+            # Off by default so the standalone solver tests stay bit-faithful to
+            # pyRTE (which keeps its by-design mu0<=0 negatives).
             NIGHT_MU0 = 1.0e-4
             mu0c = mu0 if mu0.ndim == 2 else mu0[:, :, 0]
+            toa_idx = 0 if self.top_at_1 else nlev - 1
+            toa_in = bb_dn[:, :, toa_idx]                       # (nx, ny) incoming
+            maxflux = xp.maximum(bb_dn.max(axis=2), bb_up.max(axis=2))
+            econs_bad = maxflux > toa_in * 1.01 + 1e-30
+            bad = (mu0c <= NIGHT_MU0) | econs_bad
             global _SWSOLVE_DIAG_DONE
             if not _SWSOLVE_DIAG_DONE:
                 _SWSOLVE_DIAG_DONE = True
                 print(
                     f"[SWSOLVE] mu0 min={float(mu0c.min()):.4g} "
                     f"max={float(mu0c.max()):.4g} "
-                    f"nnight={int((mu0c <= NIGHT_MU0).sum())}/{int(mu0c.size)} "
+                    f"nnight={int((mu0c <= NIGHT_MU0).sum())} "
+                    f"nbad_econs={int(econs_bad.sum())}/{int(mu0c.size)} "
                     f"raw bb_dn[min,max]={float(bb_dn.min()):.4g},"
                     f"{float(bb_dn.max()):.4g} "
                     f"bb_up[min,max]={float(bb_up.min()):.4g},"
                     f"{float(bb_up.max()):.4g}",
                     flush=True,
                 )
-            night = (mu0c <= NIGHT_MU0)[:, :, None]
+            night = bad[:, :, None]
             bb_up = xp.where(night, 0.0, bb_up)
             bb_dn = xp.where(night, 0.0, bb_dn)
             bb_dir = xp.where(night, 0.0, bb_dir)
