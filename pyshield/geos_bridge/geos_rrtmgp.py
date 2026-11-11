@@ -212,6 +212,30 @@ class GEOSRRTMGP:
                             flush=True,
                         )
 
+        if os.environ.get("GEOS_RRTMGP_DEBUG"):
+            global _RAD_MARSH_DONE
+            if not _RAD_MARSH_DONE:
+                _RAD_MARSH_DONE = True
+                fd = np.asarray(outputs.get("fswd"), dtype=np.float64)
+                fu = np.asarray(outputs.get("fswu"), dtype=np.float64)
+                if fd.ndim == 2 and fd.size:
+                    it, isf = (0, -1) if flip else (-1, 0)
+                    toa = fd[:, it]
+                    sfc_net = fd[:, isf] - fu[:, isf]
+                    toa_net = fd[:, it] - fu[:, it]
+                    ok = toa > 1.0e-2
+                    rt = np.zeros_like(toa)
+                    rt[ok] = sfc_net[ok] / toa[ok]
+                    j = int(np.argmax(np.abs(rt)))
+                    print(
+                        f"[SWMARSH] flip={flip} shape={fd.shape} worst col={j} "
+                        f"sfc_net/toa={rt[j]:.4g} toa_dn={toa[j]:.4g} "
+                        f"toa_up={fu[j, it]:.4g} toa_net={toa_net[j]:.4g} "
+                        f"sfc_dn={fd[j, isf]:.4g} sfc_up={fu[j, isf]:.4g} "
+                        f"sfc_net={sfc_net[j]:.4g}",
+                        flush=True,
+                    )
+
         return outputs
 
     def finalize(self):
@@ -227,6 +251,7 @@ class GEOSRRTMGP:
 GEOS_RRTMGP = None
 _RAD_DEBUG_DONE = False
 _RAD_DEBUG_OUT_DONE = False
+_RAD_MARSH_DONE = False
 
 
 def geos_rrtmgp_init(
